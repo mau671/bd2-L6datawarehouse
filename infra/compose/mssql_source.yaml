@@ -1,0 +1,33 @@
+services:
+  mssql_source:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mssql_source
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${MSSQL_SOURCE_SA_PASSWORD:-YourStrong@Passw0rd1}"
+      MSSQL_PID: "Developer"
+    ports:
+      - "14331:1433"
+    volumes:
+      - ./../volumes/mssql_source/data:/var/opt/mssql
+      - ./../backups:/var/opt/mssql/backup          # coloca aquí DB_SALES.bak
+      - ./../db/init_source:/scripts
+    healthcheck:
+      test: [ "CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P $$MSSQL_SA_PASSWORD -Q \"SELECT 1\" || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  init_source:
+    image: mcr.microsoft.com/mssql-tools:latest
+    container_name: mssql_source_init
+    depends_on:
+      mssql_source:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: "${MSSQL_SOURCE_SA_PASSWORD:-YourStrong@Passw0rd1}"
+      MSSQL_HOST: "mssql_source"
+    volumes:
+      - ./../db/init_source:/scripts
+      - ./../backups:/var/opt/mssql/backup
+    entrypoint: ["/bin/bash","-lc","bash /scripts/run-init.sh"]
