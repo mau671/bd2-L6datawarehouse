@@ -52,3 +52,8 @@ Inicializar DB_SALES:
 docker compose -f infra/compose/mssql_source.yaml up -d mssql_source
 docker logs -f mssql_source   # espera "ready"
 docker compose -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
+
+Inicializar DB_DW:
+docker compose -f infra/compose/mssql_dw.yaml up -d mssql_dw
+docker logs -f mssql_dw   # espera "ready"
+docker compose -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
