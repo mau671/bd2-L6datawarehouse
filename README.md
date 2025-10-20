@@ -46,3 +46,9 @@ Luego, para crear el entorno virtual y descargar las dependencias, ejecutar:
 ```bash
 uv sync
 ```
+
+Inicializar DB_SALES:
+
+docker compose -f infra/compose/mssql_source.yaml up -d mssql_source
+docker logs -f mssql_source   # espera "ready"
+docker compose -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
