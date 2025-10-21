@@ -2,6 +2,8 @@ services:
   mssql_source:
     image: mcr.microsoft.com/mssql/server:2022-latest
     container_name: mssql_source
+    env_file:
+      - ../../.env
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: "${MSSQL_SOURCE_SA_PASSWORD:-YourStrong@Passw0rd1}"
@@ -25,6 +27,7 @@ services:
       mssql_source:
         condition: service_healthy
     environment:
+      # load password from project .env via service env_file above
       MSSQL_SA_PASSWORD: "${MSSQL_SOURCE_SA_PASSWORD:-YourStrong@Passw0rd1}"
       MSSQL_HOST: "mssql_source"
     volumes:

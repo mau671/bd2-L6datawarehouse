@@ -1,9 +1,9 @@
-version: "3.9"
-
 services:
   mssql_dw:
     image: mcr.microsoft.com/mssql/server:2022-latest
     container_name: mssql_dw
+    env_file:
+      - ../../.env
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: "${MSSQL_DW_SA_PASSWORD:-YourStrong@Passw0rd2}"
@@ -26,6 +26,7 @@ services:
       mssql_dw:
         condition: service_healthy
     environment:
+      # load password from project .env via service env_file above
       MSSQL_SA_PASSWORD: "${MSSQL_DW_SA_PASSWORD:-YourStrong@Passw0rd2}"
       MSSQL_HOST: "mssql_dw"
     volumes:
