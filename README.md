@@ -49,14 +49,21 @@ uv sync
 
 Inicializar DB_SALES:
 
+```bash
+# Inicia contenedor de origen y ejecuta init
 docker compose -f infra/compose/mssql_source.yaml up -d mssql_source
 docker logs -f mssql_source   # espera "ready"
 docker compose -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
+```
 
 Inicializar DB_DW:
+
+```bash
+# Inicia contenedor DW y ejecuta init
 docker compose -f infra/compose/mssql_dw.yaml up -d mssql_dw
 docker logs -f mssql_dw   # espera "ready"
 docker compose -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
+```
 
 
 ## Reinicializar desde cero (borrar y recrear bases de datos)
@@ -147,8 +154,9 @@ sqlcmd -S localhost,14332 -U sa -P "PassSuperSegura!"
 
 Si las variables de entorno `MSSQL_SOURCE_SA_PASSWORD` o `MSSQL_DW_SA_PASSWORD` cambian en el archivo `.env`, actualizar las contraseñas en el cliente o usar las variables en los comandos de conexión.
 
-
 ## Estructura del proyecto
+
+```
 dw-proyecto/
 ├─ pyproject.toml
 ├─ uv.lock
@@ -230,3 +238,4 @@ dw-proyecto/
 │  └─ test_currency_conversions.py
 └─ scripts/
    └─ seed_fake_clients.py       # p.ej. cliente “AGG_JSON” para el archivo mensual
+```
