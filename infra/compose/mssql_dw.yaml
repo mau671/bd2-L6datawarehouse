@@ -1,3 +1,4 @@
+name: mssql_dw_stack
 services:
   mssql_dw:
     image: mcr.microsoft.com/mssql/server:2022-latest
@@ -11,8 +12,10 @@ services:
     ports:
       - "14332:1433"
     volumes:
-      - ./../volumes/mssql_dw/data:/var/opt/mssql
+      - mssql_dw_data:/var/opt/mssql
       - ./../db/init_dw:/scripts
+    networks:
+      - dw_net
     healthcheck:
       test: [ "CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P $$MSSQL_SA_PASSWORD -Q \"SELECT 1\" || exit 1" ]
       interval: 10s
@@ -31,5 +34,15 @@ services:
       MSSQL_HOST: "mssql_dw"
     volumes:
       - ./../db/init_dw:/scripts
+    networks:
+      - dw_net
     entrypoint: ["/bin/bash","-lc","bash /scripts/run-init.sh"]
+
+volumes:
+  mssql_dw_data:
+    name: mssql_dw_data
+
+networks:
+  dw_net:
+    external: true
 

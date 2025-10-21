@@ -1,3 +1,4 @@
+name: mssql_source_stack
 services:
   mssql_source:
     image: mcr.microsoft.com/mssql/server:2022-latest
@@ -11,9 +12,11 @@ services:
     ports:
       - "14331:1433"
     volumes:
-      - ./../volumes/mssql_source/data:/var/opt/mssql
+      - mssql_source_data:/var/opt/mssql
       - ./../backups:/var/opt/mssql/backup          # coloca aquí DB_SALES.bak
       - ./../db/init_source:/scripts
+    networks:
+      - dw_net
     healthcheck:
       test: [ "CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P $$MSSQL_SA_PASSWORD -Q \"SELECT 1\" || exit 1" ]
       interval: 10s
@@ -33,4 +36,14 @@ services:
     volumes:
       - ./../db/init_source:/scripts
       - ./../backups:/var/opt/mssql/backup
+    networks:
+      - dw_net
     entrypoint: ["/bin/bash","-lc","bash /scripts/run-init.sh"]
+
+volumes:
+  mssql_source_data:
+    name: mssql_source_data
+
+networks:
+  dw_net:
+    external: true

@@ -47,6 +47,12 @@ Luego, para crear el entorno virtual y descargar las dependencias, ejecutar:
 uv sync
 ```
 
+Crear red interna (una sola vez):
+
+```bash
+docker network create dw_net || true
+```
+
 Inicializar DB_SALES:
 
 ```bash
@@ -55,6 +61,33 @@ docker compose -f infra/compose/mssql_source.yaml up -d mssql_source
 docker logs -f mssql_source   # espera "ready"
 docker compose -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
 ```
+
+Permisos y notas:
+
+- Linux/macOS:
+  - Asegurar permisos de ejecución para scripts:
+    
+    ```bash
+    chmod +x infra/db/init_source/run-init.sh
+    ```
+    
+  - Asegurar lectura del backup (si existe `DB_SALES.bak`):
+    
+    ```bash
+    chmod a+r infra/backups/DB_SALES.bak
+    ```
+    
+- Windows (Docker Desktop):
+  - Colocar el archivo `DB_SALES.bak` en `infra\backups\DB_SALES.bak`.
+  - No es necesario aplicar `chmod`; ejecutar los mismos comandos anteriores en PowerShell.
+  - Opcional (PowerShell):
+    
+    ```powershell
+    docker network create dw_net 2>$null
+    docker compose -f infra/compose/mssql_source.yaml up -d mssql_source
+    docker logs -f mssql_source
+    docker compose -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
+    ```
 
 Inicializar DB_DW:
 
@@ -65,6 +98,25 @@ docker logs -f mssql_dw   # espera "ready"
 docker compose -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
 ```
 
+Permisos y notas:
+
+- Linux/macOS:
+  - Asegurar permisos de ejecución para scripts:
+    
+    ```bash
+    chmod +x infra/db/init_dw/run-init.sh
+    ```
+    
+- Windows (Docker Desktop):
+  - No es necesario aplicar `chmod`; ejecutar los mismos comandos anteriores en PowerShell.
+  - Opcional (PowerShell):
+    
+    ```powershell
+    docker network create dw_net 2>$null
+    docker compose -f infra/compose/mssql_dw.yaml up -d mssql_dw
+    docker logs -f mssql_dw
+    docker compose -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
+    ```
 
 ## Reinicializar desde cero (borrar y recrear bases de datos)
 
@@ -77,30 +129,22 @@ docker compose -f infra/compose/mssql_source.yaml down --volumes --remove-orphan
 docker compose -f infra/compose/mssql_dw.yaml down --volumes --remove-orphans
 ```
 
-2. Eliminar y recrear los directorios de datos:
+1. (Opcional) Eliminar volúmenes de datos si quieres limpiar completamente:
 
 ```bash
-rm -rf infra/volumes/mssql_source/data
-rm -rf infra/volumes/mssql_dw/data
-mkdir -p infra/volumes/mssql_source/data
-mkdir -p infra/volumes/mssql_dw/data
+# Estos volúmenes guardan los datos de SQL Server
+docker volume rm mssql_source_data || true
+docker volume rm mssql_dw_data || true
 ```
 
-3. Asignar permisos adecuados a los directorios de datos:
-
-```bash
-chmod -R 777 infra/volumes/mssql_source/data
-chmod -R 777 infra/volumes/mssql_dw/data
-```
-
-4. Asignar permisos de ejecución a los scripts de inicialización:
+1. Asignar permisos de ejecución a los scripts de inicialización:
 
 ```bash
 chmod +x infra/db/init_source/run-init.sh
 chmod +x infra/db/init_dw/run-init.sh
 ```
 
-5. Levantar los servicios base y esperar a que estén listos:
+1. Levantar los servicios base y esperar a que estén listos:
 
 ```bash
 docker compose -f infra/compose/mssql_source.yaml up -d mssql_source
@@ -114,7 +158,7 @@ docker logs -f mssql_source
 docker logs -f mssql_dw
 ```
 
-6. Ejecutar la inicialización de las bases de datos:
+1. Ejecutar la inicialización de las bases de datos:
 
 ```bash
 docker compose -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
@@ -156,7 +200,7 @@ Si las variables de entorno `MSSQL_SOURCE_SA_PASSWORD` o `MSSQL_DW_SA_PASSWORD` 
 
 ## Estructura del proyecto
 
-```
+```text
 dw-proyecto/
 ├─ pyproject.toml
 ├─ uv.lock
