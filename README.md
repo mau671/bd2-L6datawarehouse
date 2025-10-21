@@ -53,13 +53,15 @@ Crear red interna (una sola vez):
 docker network create dw_net || true
 ```
 
+**Nota sobre credenciales**: Los archivos de compose (`infra/compose/*.yaml`) usan variables para las contraseñas de SQL Server (ej. `${MSSQL_SOURCE_SA_PASSWORD}`). Estas variables se leen desde el archivo `.env` en la raíz del proyecto. Para que `docker compose` pueda sustituir estas variables correctamente, es **necesario** indicar la ruta al archivo `.env` usando el flag `--env-file .env` en todos los comandos.
+
 Inicializar DB_SALES:
 
 ```bash
 # Inicia contenedor de origen y ejecuta init
-docker compose -f infra/compose/mssql_source.yaml up -d mssql_source
+docker compose --env-file .env -f infra/compose/mssql_source.yaml up -d mssql_source
 docker logs -f mssql_source   # espera "ready"
-docker compose -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
+docker compose --env-file .env -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
 ```
 
 Permisos y notas:
@@ -93,9 +95,9 @@ Inicializar DB_DW:
 
 ```bash
 # Inicia contenedor DW y ejecuta init
-docker compose -f infra/compose/mssql_dw.yaml up -d mssql_dw
+docker compose --env-file .env -f infra/compose/mssql_dw.yaml up -d mssql_dw
 docker logs -f mssql_dw   # espera "ready"
-docker compose -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
+docker compose --env-file .env -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
 ```
 
 Permisos y notas:
@@ -125,8 +127,8 @@ Estos pasos eliminan todos los datos y recrean las bases de datos desde cero.
 1. Detener y eliminar los contenedores y volúmenes:
 
 ```bash
-docker compose -f infra/compose/mssql_source.yaml down --volumes --remove-orphans
-docker compose -f infra/compose/mssql_dw.yaml down --volumes --remove-orphans
+docker compose --env-file .env -f infra/compose/mssql_source.yaml down --volumes --remove-orphans
+docker compose --env-file .env -f infra/compose/mssql_dw.yaml down --volumes --remove-orphans
 ```
 
 1. (Opcional) Eliminar volúmenes de datos si quieres limpiar completamente:
@@ -144,11 +146,11 @@ chmod +x infra/db/init_source/run-init.sh
 chmod +x infra/db/init_dw/run-init.sh
 ```
 
-1. Levantar los servicios base y esperar a que estén listos:
+4. Levantar los servicios base y esperar a que estén listos:
 
 ```bash
-docker compose -f infra/compose/mssql_source.yaml up -d mssql_source
-docker compose -f infra/compose/mssql_dw.yaml up -d mssql_dw
+docker compose --env-file .env -f infra/compose/mssql_source.yaml up -d mssql_source
+docker compose --env-file .env -f infra/compose/mssql_dw.yaml up -d mssql_dw
 ```
 
 Verificar que ambos servicios estén listos antes de continuar. Se puede usar:
@@ -158,11 +160,11 @@ docker logs -f mssql_source
 docker logs -f mssql_dw
 ```
 
-1. Ejecutar la inicialización de las bases de datos:
+5. Ejecutar la inicialización de las bases de datos:
 
 ```bash
-docker compose -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
-docker compose -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
+docker compose --env-file .env -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
+docker compose --env-file .env -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
 ```
 
 Notas:
