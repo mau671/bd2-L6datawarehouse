@@ -86,9 +86,9 @@ Permisos y notas:
     
     ```powershell
     docker network create dw_net 2>$null
-    docker compose -f infra/compose/mssql_source.yaml up -d mssql_source
+    docker compose --env-file .env -f infra/compose/mssql_source.yaml up -d mssql_source
     docker logs -f mssql_source
-    docker compose -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
+    docker compose --env-file .env -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
     ```
 
 Inicializar DB_DW:
@@ -115,9 +115,9 @@ Permisos y notas:
     
     ```powershell
     docker network create dw_net 2>$null
-    docker compose -f infra/compose/mssql_dw.yaml up -d mssql_dw
+    docker compose --env-file .env -f infra/compose/mssql_dw.yaml up -d mssql_dw
     docker logs -f mssql_dw
-    docker compose -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
+    docker compose --env-file .env -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
     ```
 
 ## Reinicializar desde cero (borrar y recrear bases de datos)
