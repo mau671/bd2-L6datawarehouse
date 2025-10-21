@@ -1,0 +1,23 @@
+# Ignore docker volumes and data directories used by the local dev infra
+infra/volumes/
+infra/volumes/*
+
+# Ignore backups and DB dumps
+infra/backups/
+
+# Ignore environment files containing secrets
+.env
+
+# Ignore python virtual envs and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Editor files
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
