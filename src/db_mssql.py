@@ -208,7 +208,7 @@ def extract_source_data(conn):
         'warehouses': "SELECT WhsCode, WhsName FROM OWHS",
         'countries': "SELECT Country, Name FROM OCRY", 
         'brands': "SELECT Code, Name FROM MARCAS",
-        'zones': "SELECT Code, Name FROM ZONAS", 
+        'zones': "SELECT Code, Name FROM ZONAS",
         'product_cost': "SELECT ItemCode, WhsCode, AvgPrice FROM OITW"
     }
 
@@ -280,6 +280,12 @@ def load_dimensions(dw_conn, source_data):
     dim_dfs['country'] = process_and_load_dim(
         source_data['countries'], 'Country', 'country', dw_conn, 'DIM_COUNTRY'
     )
+    # Normalize country iso codes in country dim
+    try:
+        if isinstance(dim_dfs.get('country'), pd.DataFrame) and 'iso2' in dim_dfs['country'].columns:
+            dim_dfs['country']['iso2'] = dim_dfs['country']['iso2'].astype(str).str.strip().str.upper()
+    except Exception:
+        pass
     
     # D. DIM_CURRENCY 
     dim_currency = pd.DataFrame({'name': ['Colones', 'Dólares'], 'code': ['CRC', 'USD']})
@@ -291,23 +297,93 @@ def load_dimensions(dw_conn, source_data):
     df_products = source_data['products'].merge(
         source_data['brands'], left_on='U_Marca', right_on='Code', how='left', suffixes=('_prod', '_brand')
     )
-    df_products = df_products.rename(columns={'Name_brand': 'brand', 'ItemName': 'name'}) 
-    df_products['name'] = df_products['name'].str.strip()
+    # Prefer brand name from MARCAS (Name_brand); otherwise fall back to U_Marca from OITM
+    if 'Name_brand' in df_products.columns:
+        df_products['brand'] = df_products['Name_brand'].fillna(df_products.get('U_Marca'))
+    else:
+        df_products['brand'] = df_products.get('U_Marca')
+    df_products = df_products.rename(columns={'ItemName': 'name'})
+    # Normalize
+    df_products['brand'] = df_products['brand'].fillna('').astype(str).str.strip()
+    df_products['name'] = df_products['name'].astype(str).str.strip()
     df_products = df_products.drop_duplicates(subset=['name'], keep='first')
     dim_dfs['product'] = process_and_load_dim(
         df_products, 'ItemCode', 'product', dw_conn, 'DIM_PRODUCTS'
     )
 
     # F. DIM_CUSTOMERS (OCRD + ZONAS)
+    # Detect if zones table contains a column with country codes (ISO2-like). Prefer OCRD.Country otherwise.
+    zones_df = source_data.get('zones', pd.DataFrame())
+    zone_country_col = None
+    try:
+        if not zones_df.empty:
+            # prefer explicit 'Country' if present
+            if 'Country' in zones_df.columns:
+                zone_country_col = 'Country'
+            else:
+                # try to heuristically find a 2-letter iso code column
+                for col in zones_df.columns:
+                    if col.lower() in ('code', 'name'):
+                        continue
+                    sample = zones_df[col].dropna().astype(str).str.strip()
+                    if sample.empty:
+                        continue
+                    s = sample.str.upper()
+                    # proportion of values that look like 2-letter codes
+                    prop_iso2 = (s.str.len() == 2).mean()
+                    if prop_iso2 >= 0.25:
+                        zone_country_col = col
+                        break
+    except Exception:
+        zone_country_col = None
+
     df_customers = source_data['customers'].merge(
         source_data['zones'], left_on='U_Zona', right_on='Code', how='left', suffixes=('_cust', '_zone')
     )
+    # Build country_code: prefer OCRD.Country, then zone candidate column if found
+    try:
+        if 'Country' in df_customers.columns and df_customers['Country'].notna().any():
+            df_customers['country_code'] = df_customers['Country']
+        elif zone_country_col:
+            # handle merged suffixes (col or col_zone)
+            col_candidate = zone_country_col if zone_country_col in df_customers.columns else (zone_country_col + '_zone')
+            if col_candidate in df_customers.columns:
+                df_customers['country_code'] = df_customers[col_candidate]
+            else:
+                df_customers['country_code'] = np.nan
+        else:
+            df_customers['country_code'] = np.nan
+    except Exception:
+        df_customers['country_code'] = np.nan
+
     df_customers = df_customers.rename(columns={
-        'Name_zone': 'zona', 'CardName': 'name', 'Country': 'country_code', 'U_Zona': 'zone_code'
+        'Name_zone': 'zona', 'CardName': 'name', 'U_Zona': 'zone_code'
     })
+    # Normalize customer country codes to match DIM_COUNTRY.iso2
+    try:
+        if 'country_code' in df_customers.columns:
+            df_customers['country_code'] = df_customers['country_code'].fillna('').astype(str).str.strip().str.upper()
+    except Exception:
+        pass
+
     dim_dfs['customer'] = process_and_load_dim(
         df_customers, 'CardCode', 'customer', dw_conn, 'DIM_CUSTOMERS'
     )
+    # Enrich the returned customer lookup with country_code so we can resolve idCountry later
+    try:
+        if isinstance(dim_dfs.get('customer'), pd.DataFrame):
+            # Ensure df_customers exposes a 'cardCode' column to match the canonical name
+            if 'CardCode' in df_customers.columns and 'cardCode' not in df_customers.columns:
+                df_customers['cardCode'] = df_customers['CardCode']
+            # If the customer lookup has 'cardCode' and df_customers has 'country_code', merge them
+            if 'cardCode' in dim_dfs['customer'].columns and 'country_code' in df_customers.columns:
+                dim_dfs['customer'] = dim_dfs['customer'].merge(
+                    df_customers[['cardCode', 'country_code']].drop_duplicates(subset=['cardCode']),
+                    on='cardCode', how='left'
+                )
+    except Exception:
+        # non-critical: if enrichment fails, continue without country_code in customer lookup
+        pass
 
     # G. DIM_TIME (idDate)
     df_dates = source_data['sales_fact'][['DocDate']].copy() 
@@ -410,6 +486,77 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
         # Attempt common column names
         if 'CardCode' in df_fact.columns and 'cardCode' in df_fact.columns:
             df_fact = df_fact.merge(dim_dfs.get('customer', pd.DataFrame()), left_on='CardCode', right_on='cardCode', how='left')
+
+    # --- Attempt to derive idCountry via the customer lookup's country_code when source fact has no Country column ---
+    try:
+        if 'customer' in dim_dfs and isinstance(dim_dfs['customer'], pd.DataFrame):
+            # if the customer lookup contains country_code, bring it into df_fact using idCustomer
+            if 'country_code' in dim_dfs['customer'].columns and 'idCustomer' in df_fact.columns:
+                # normalize country codes
+                try:
+                    dim_dfs['customer']['country_code'] = dim_dfs['customer']['country_code'].astype(str).str.strip().str.upper()
+                except Exception:
+                    pass
+                df_fact = df_fact.merge(dim_dfs['customer'][['idCustomer', 'country_code']], on='idCustomer', how='left')
+                # now map country_code (iso2) to idCountry using dim_dfs['country'] if available
+                if 'country' in dim_dfs and isinstance(dim_dfs['country'], pd.DataFrame):
+                    try:
+                        dim_dfs['country']['iso2'] = dim_dfs['country']['iso2'].astype(str).str.strip().str.upper()
+                    except Exception:
+                        pass
+                    df_fact = df_fact.merge(dim_dfs['country'][['idCountry', 'iso2']], left_on='country_code', right_on='iso2', how='left')
+                    # If merge produced idCountry from right side, keep it. If not, ensure column exists
+                    if 'idCountry' not in df_fact.columns:
+                        df_fact['idCountry'] = None
+    except Exception:
+        # non-critical: leave idCountry as-is or None
+        pass
+
+    # Propagate country information from the customer lookup into the fact, then map to idCountry
+    try:
+        cust_df = dim_dfs.get('customer')
+        country_df = dim_dfs.get('country')
+        # Merge country_code from customer lookup using idCustomer (if present)
+        if isinstance(cust_df, pd.DataFrame) and 'country_code' in cust_df.columns and 'idCustomer' in df_fact.columns:
+            df_fact = df_fact.merge(
+                cust_df[['idCustomer', 'country_code']].drop_duplicates(subset=['idCustomer']),
+                on='idCustomer', how='left'
+            )
+
+        # Also attempt to merge country_code by business CardCode (safer if idCustomer was missing)
+        if isinstance(cust_df, pd.DataFrame) and 'cardCode' in cust_df.columns and 'CardCode' in df_fact.columns:
+            # normalize both sides for matching
+            try:
+                df_fact['CardCode_norm'] = df_fact['CardCode'].fillna('').astype(str).str.strip().str.upper()
+                cust_codes = cust_df[['cardCode', 'country_code']].drop_duplicates(subset=['cardCode']).copy()
+                cust_codes['cardCode'] = cust_codes['cardCode'].fillna('').astype(str).str.strip().str.upper()
+                df_fact = df_fact.merge(cust_codes, left_on='CardCode_norm', right_on='cardCode', how='left', suffixes=('', '_from_card'))
+                # coalesce any country_code values
+                if 'country_code' in df_fact.columns and 'country_code_from_card' in df_fact.columns:
+                    df_fact['country_code'] = df_fact['country_code'].fillna(df_fact['country_code_from_card'])
+                    df_fact = df_fact.drop(columns=['country_code_from_card', 'cardCode'])
+                # drop helper
+                df_fact = df_fact.drop(columns=['CardCode_norm'])
+            except Exception:
+                pass
+
+        # Now map country_code (ISO2) to idCountry using country dim
+        if isinstance(country_df, pd.DataFrame) and 'iso2' in country_df.columns:
+            try:
+                country_map = country_df[['iso2', 'idCountry']].drop_duplicates(subset=['iso2']).copy()
+                country_map['iso2'] = country_map['iso2'].astype(str).str.strip().str.upper()
+                if 'country_code' in df_fact.columns:
+                    df_fact['country_code'] = df_fact['country_code'].fillna('').astype(str).str.strip().str.upper()
+                    df_fact = df_fact.merge(country_map, left_on='country_code', right_on='iso2', how='left')
+                    # If idCountry already exists (unlikely), coalesce
+                    if 'idCountry' in df_fact.columns:
+                        # keep existing idCountry if present, else use mapped idCountry
+                        df_fact['idCountry'] = df_fact['idCountry'].where(df_fact['idCountry'].notna(), df_fact['idCountry'])
+            except Exception:
+                pass
+    except Exception:
+        # non-critical
+        pass
 
     # ---------------------------
     # Merge con DIM_PRODUCTS
