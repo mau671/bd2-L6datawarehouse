@@ -4,14 +4,27 @@ import numpy as np
 from datetime import datetime
 from db_config import (  SOURCE_CONN_STR, DW_CONN_STR, connect_to_db )
 from db_create_tables import create_dw_schema
-
+import warnings
 import traceback
+from decimal import Decimal, InvalidOperation
+
+# Control verbose output globally. Set to False to suppress informational prints.
+VERBOSE = False
+
+# Suppress a noisy pandas UserWarning when passing raw DB-API connections to pd.read_sql.
+# Preferred fix: pass a SQLAlchemy engine to pd.read_sql. This global filter silences only
+# the specific message so other warnings still appear.
+warnings.filterwarnings(
+    "ignore",
+    message="pandas only supports SQLAlchemy connectable",
+    category=UserWarning,
+)
 
 # ====================================================================
-# 1. FUNCIONES AUXILIARES (Sin Cambios Críticos en la Lógica)
+# 1. FUNCIONES AUXILIARES
 # ====================================================================
 
-# ... (Función process_and_load_dim)
+
 def process_and_load_dim(df_source, source_key, dim_name, dw_conn, dw_table):
     """
     Genera SK, maneja 'UNK' para WAREHOUSE, mapea columnas y carga la dimensión
@@ -94,7 +107,6 @@ def process_and_load_dim(df_source, source_key, dim_name, dw_conn, dw_table):
         df_to_load = df_to_load.rename(columns={'CardCode': 'cardCode', 'zone_name': 'zona'})
     elif dw_table == 'DIM_PRODUCTS':
         df_to_load = df_to_load.rename(columns={'ItemCode': 'itemCode', 'brand_name': 'brand'})
-        # 🚨 CORRECCIÓN (Error 2): La limpieza se hizo en load_dimensions, aquí solo aseguramos el tipo
     elif dw_table == 'DIM_SALESPERSON':
         df_to_load = df_to_load.rename(columns={'SlpCode': 'spCode', 'SlpName': 'name'})
     elif dw_table == 'DIM_COUNTRY':
@@ -119,7 +131,7 @@ def process_and_load_dim(df_source, source_key, dim_name, dw_conn, dw_table):
         placeholders = ', '.join(['?' for _ in df_to_load.columns])
 
         if dw_table == 'DIM_WAREHOUSE':
-            # 🚨 CORRECCIÓN FINAL (Error 544): La tabla tiene IDENTITY y necesitamos ID=0, por lo que se requiere ON/OFF.
+
             insert_sql = (
                 f"SET IDENTITY_INSERT dw.{dw_table} ON; "
                 f"INSERT INTO dw.{dw_table} ({cols}) VALUES ({placeholders}); "
@@ -185,7 +197,7 @@ def extract_source_data(conn):
     Extrae datos maestros y transacciones. Asegura que los nombres de las 
     columnas clave del origen sean consistentes.
     """
-    
+
     print("Iniciando Extracción de Datos Fuente...")
 
     # A. Tablas de Dimensiones (Maestros) - Nombres consistentes
@@ -250,6 +262,7 @@ def extract_source_data(conn):
 def load_dimensions(dw_conn, source_data):
     """Transforma, carga las dimensiones y genera los DataFrames de lookup."""
     
+
     print("\nIniciando Carga y Transformación de Dimensiones...")
     dim_dfs = {} 
 
@@ -320,7 +333,6 @@ def load_dimensions(dw_conn, source_data):
 
     # Ahora dim_dfs['time'] conserva todas las columnas necesarias
 
-
     print("Carga de Dimensiones completada.")
     return dim_dfs
 
@@ -350,31 +362,6 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
 
     if df_fact is None:
         raise TypeError("load_fact_sales expected 'source_data' to contain a pandas.DataFrame for sales facts (key 'sales_fact').")
-
-    # ---------------------------
-    # DEBUG: quick diagnostics before merging
-    # ---------------------------
-    DEBUG = True
-    if DEBUG:
-        try:
-            print('\n[DEBUG] df_fact.shape =', getattr(df_fact, 'shape', None))
-            print('[DEBUG] df_fact.columns =', list(df_fact.columns))
-            print('[DEBUG] df_fact.head() =')
-            print(df_fact.head().to_string(index=False))
-        except Exception as _:
-            print('[DEBUG] Could not print df_fact')
-
-        for k, v in dim_dfs.items():
-            try:
-                if isinstance(v, pd.DataFrame):
-                    print(f"[DEBUG] dim_dfs['{k}'].shape =", v.shape)
-                    print(f"[DEBUG] dim_dfs['{k}'].columns =", list(v.columns))
-                    print(f"[DEBUG] dim_dfs['{k}'].head() =")
-                    print(v.head().to_string(index=False))
-                else:
-                    print(f"[DEBUG] dim_dfs['{k}'] is not a DataFrame: {type(v)}")
-            except Exception as _:
-                print(f"[DEBUG] Could not print dim_dfs['{k}']")
 
     # ---------------------------
     # DIM_TIME: preparar lookup y merge
@@ -506,14 +493,16 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
                     fallback_id = int(dim_dfs['product']['idProduct'].min())
                 except Exception:
                     fallback_id = 1
-                print(f"[AUTO-FILL] {missing_prod_count} rows have missing idProduct. Filling with fallback idProduct={fallback_id}.")
+                if VERBOSE:
+                    print(f"[AUTO-FILL] {missing_prod_count} rows have missing idProduct. Filling with fallback idProduct={fallback_id}.")
                 df_fact['idProduct'] = df_fact['idProduct'].fillna(fallback_id)
 
                 # If we successfully filled, attempt to cast idProduct to integer type
                 try:
                     df_fact['idProduct'] = df_fact['idProduct'].astype('int64')
                 except Exception:
-                    print('[AUTO-FILL][WARN] Could not cast idProduct to int64 after filling; leaving as-is')
+                    if VERBOSE:
+                        print('[AUTO-FILL][WARN] Could not cast idProduct to int64 after filling; leaving as-is')
 
     # Recompute final fact DataFrame after any auto-fills above
     df_fact_final = df_fact[fact_columns].copy()
@@ -522,9 +511,10 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
     required_int_cols = ['idDate', 'idCustomer', 'idProduct']
     required_numeric_cols = ['quantity']
 
-    print('\n[VALIDATION] FACT_SALES pre-insert checks')
-    print('[VALIDATION] dtypes:')
-    print(df_fact_final.dtypes)
+    if VERBOSE:
+        print('\n[VALIDATION] FACT_SALES pre-insert checks')
+        print('[VALIDATION] dtypes:')
+        print(df_fact_final.dtypes)
 
     # Check for missing required columns or nulls
     issues = False
@@ -553,28 +543,58 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
     # Check for numeric overflow against SQL Server target types
     # INT max for SQL Server
     SQL_INT_MAX = 2_147_483_647
-    # DECIMAL(21,6): max integer part is 10^(21-6)-1 = 10^15 - 1
-    DECIMAL_21_6_MAX = 1e15
+    # DECIMAL(38,10): total precision 38, scale 10 -> max integer part = 10^(38-10)-1 = 10^28 - 1
+    DECIMAL_38_10_MAX = 10**28 - 1
 
     # integer overflow checks
     int_cols = ['idDate', 'idCustomer', 'idProduct', 'idSalesperson', 'idWarehouse', 'idCountry', 'idCurrency']
+    # Coerce these columns to numeric where possible to avoid NoneType issues with abs()
     for c in int_cols:
         if c in df_fact_final.columns:
-            over = df_fact_final[df_fact_final[c].notna() & (df_fact_final[c].abs() > SQL_INT_MAX)]
+            # attempt to convert to numeric (integers); coerce errors to NaN
+            try:
+                df_fact_final[c] = pd.to_numeric(df_fact_final[c], errors='coerce')
+            except Exception:
+                # if conversion fails, leave as-is (will be handled by notna filter)
+                pass
+            # compute overflow using safe numeric comparison
+            mask_numeric = df_fact_final[c].notna()
+            over = df_fact_final[mask_numeric & (df_fact_final[c].abs() > SQL_INT_MAX)]
             if not over.empty:
                 print(f"[VALIDATION][ERROR] Integer column {c} has {len(over)} values exceeding SQL INT max ({SQL_INT_MAX}). Sample:")
                 print(over.head().to_string(index=False))
                 issues = True
 
-    # decimal overflow checks for quantity, total_usd, total_crc
+    # decimal overflow checks for quantity, total_usd, total_crc (DW uses DECIMAL(38,10))
     dec_cols = ['quantity', 'total_usd', 'total_crc']
     for c in dec_cols:
         if c in df_fact_final.columns:
-            over = df_fact_final[df_fact_final[c].notna() & (df_fact_final[c].abs() > DECIMAL_21_6_MAX)]
+            # coerce to numeric (float) for safe abs/compare
+            try:
+                df_fact_final[c] = pd.to_numeric(df_fact_final[c], errors='coerce')
+            except Exception:
+                pass
+            # Round to scale 10 (to match DECIMAL(38,10)) to avoid unexpected scale issues
+            try:
+                df_fact_final[c] = df_fact_final[c].round(10)
+            except Exception:
+                pass
+            mask_numeric = df_fact_final[c].notna()
+            over = df_fact_final[mask_numeric & (df_fact_final[c].abs() > DECIMAL_38_10_MAX)]
             if not over.empty:
-                print(f"[VALIDATION][ERROR] Decimal column {c} has {len(over)} values exceeding DECIMAL(21,6) max (~{int(DECIMAL_21_6_MAX)}). Sample:")
+                print(f"[VALIDATION][ERROR] Decimal column {c} has {len(over)} values exceeding DECIMAL(38,10) max (~{DECIMAL_38_10_MAX}). Sample:")
                 print(over.head().to_string(index=False))
                 issues = True
+
+    # Ensure textual and ID columns match DW types: source_system -> NVARCHAR, source_doc_id -> NVARCHAR
+    if 'source_system' in df_fact_final.columns:
+        # fill a sensible default where missing and ensure string dtype
+        df_fact_final['source_system'] = df_fact_final['source_system'].fillna('DB_SALES').astype(str)
+
+    if 'source_doc_id' in df_fact_final.columns:
+        # Convert to string (DW expects NVARCHAR); preserve None as empty string if needed
+        df_fact_final['source_doc_id'] = df_fact_final['source_doc_id'].where(df_fact_final['source_doc_id'].notna(), None)
+        df_fact_final['source_doc_id'] = df_fact_final['source_doc_id'].astype(object)
 
     if issues:
         raise ValueError('Validation failed for FACT_SALES; see printed messages above. Aborting insert to avoid DB errors.')
@@ -586,7 +606,48 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
         placeholders = ', '.join(['?' for _ in df_fact_final.columns])
         insert_sql = f"INSERT INTO dw.FACT_SALES ({cols}) VALUES ({placeholders})"
         cursor.fast_executemany = True
-        data_to_insert = [tuple(row) for row in df_fact_final.values]
+        # Prepare rows: ensure ints are ints, decimals are Decimal with scale 10, and strings are str/None
+        data_to_insert = []
+        for _, r in df_fact_final.iterrows():
+            row_vals = []
+            for col in df_fact_final.columns:
+                val = r[col]
+                # integer keys: ensure Python int or None
+                if col in int_cols:
+                    if pd.isna(val):
+                        row_vals.append(None)
+                    else:
+                        try:
+                            row_vals.append(int(val))
+                        except Exception:
+                            row_vals.append(None)
+                elif col in dec_cols:
+                    # decimals: convert to Decimal with scale 10
+                    if pd.isna(val):
+                        row_vals.append(None)
+                    else:
+                        try:
+                            # Use string constructor to preserve precision
+                            d = Decimal(str(val)).quantize(Decimal('1.' + '0'*10))
+                            row_vals.append(d)
+                        except (InvalidOperation, Exception):
+                            # fallback: try rounding then Decimal
+                            try:
+                                d = Decimal(str(round(float(val), 10)))
+                                row_vals.append(d)
+                            except Exception:
+                                row_vals.append(None)
+                else:
+                    # For strings and other types: keep None or string
+                    if pd.isna(val):
+                        row_vals.append(None)
+                    else:
+                        # Ensure native Python types for pyodbc
+                        if isinstance(val, (np.integer, np.floating)):
+                            row_vals.append(val.item())
+                        else:
+                            row_vals.append(val)
+            data_to_insert.append(tuple(row_vals))
         try:
             cursor.executemany(insert_sql, data_to_insert)
             dw_conn.commit()
@@ -603,11 +664,18 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
                 row_cursor = dw_conn.cursor()
                 try:
                     row_cursor.execute(insert_sql, row)
-                    row_cursor.commit()
+                    # commit using the connection (cursor.commit doesn't exist on pyodbc cursors)
+                    try:
+                        dw_conn.commit()
+                    except Exception as commit_err:
+                        # capture commit errors as part of the row failure
+                        err_info = (type(commit_err).__name__, str(commit_err))
+                        failed_rows.append((idx, row, err_info))
+                        continue
                     success_count += 1
-                except pyodbc.Error as row_err:
-                    # capture full error details
-                    err_info = getattr(row_err, 'args', (str(row_err),))
+                except Exception as row_err:
+                    # capture full error details (pyodbc.Error or other exceptions)
+                    err_info = (type(row_err).__name__, getattr(row_err, 'args', (str(row_err),)))
                     failed_rows.append((idx, row, err_info))
                     # continue to attempt remaining rows
                 finally:
@@ -630,13 +698,6 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
     except Exception as e:
         print(f"❌ ERROR inesperado al insertar FACT_SALES: {e}")
         dw_conn.rollback()
-
-
-
-
-
-
-
 
 # ====================================================================
 # 5. FUNCIÓN PRINCIPAL DE EJECUCIÓN (Orquestación)
@@ -681,7 +742,7 @@ def run_etl():
             source_conn.close()
         if dw_conn:
             dw_conn.close()
-        print("Conexiones a DB cerradas.")
+            print("Conexiones a DB cerradas.")
 
 if __name__ == "__main__":
     run_etl()
