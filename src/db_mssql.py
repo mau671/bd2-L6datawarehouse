@@ -356,9 +356,22 @@ def load_dimensions(dw_conn, source_data):
     except Exception:
         df_customers['country_code'] = np.nan
 
-    df_customers = df_customers.rename(columns={
-        'Name_zone': 'zona', 'CardName': 'name', 'U_Zona': 'zone_code'
-    })
+    # Determine the zone name column produced by the merge. Pandas only adds suffixes
+    # when there is a column name conflict, so the zones 'Name' column may be 'Name' or 'Name_zone'.
+    zona_col = None
+    for cand in ['Name_zone', 'Name', 'Name_zone', 'name_zone']:
+        if cand in df_customers.columns:
+            zona_col = cand
+            break
+
+    if zona_col:
+        df_customers['zona'] = df_customers[zona_col]
+    else:
+        # no zone name available, create empty
+        df_customers['zona'] = np.nan
+
+    # Standard renames
+    df_customers = df_customers.rename(columns={'CardName': 'name', 'U_Zona': 'zone_code'})
     # Normalize customer country codes to match DIM_COUNTRY.iso2
     try:
         if 'country_code' in df_customers.columns:
