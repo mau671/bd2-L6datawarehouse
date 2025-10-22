@@ -553,18 +553,33 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
             except Exception:
                 pass
 
-        # Now map country_code (ISO2) to idCountry using country dim
+        # Now map country_code (ISO2) to idCountry using country dim (use mapping to avoid merge-suffix issues)
         if isinstance(country_df, pd.DataFrame) and 'iso2' in country_df.columns:
             try:
-                country_map = country_df[['iso2', 'idCountry']].drop_duplicates(subset=['iso2']).copy()
-                country_map['iso2'] = country_map['iso2'].astype(str).str.strip().str.upper()
+                # build map iso2 -> idCountry
+                tmp = country_df[['iso2', 'idCountry']].drop_duplicates(subset=['iso2']).copy()
+                tmp['iso2'] = tmp['iso2'].astype(str).str.strip().str.upper()
+                country_map = dict(zip(tmp['iso2'], tmp['idCountry']))
+
+                # Determine effective country code for each fact row: prefer source 'Country', else 'country_code' from customer
+                df_fact['country_code_norm'] = ''
+                if 'Country' in df_fact.columns:
+                    df_fact['country_code_norm'] = df_fact['Country'].fillna('').astype(str).str.strip().str.upper()
                 if 'country_code' in df_fact.columns:
-                    df_fact['country_code'] = df_fact['country_code'].fillna('').astype(str).str.strip().str.upper()
-                    df_fact = df_fact.merge(country_map, left_on='country_code', right_on='iso2', how='left')
-                    # If idCountry already exists (unlikely), coalesce
-                    if 'idCountry' in df_fact.columns:
-                        # keep existing idCountry if present, else use mapped idCountry
-                        df_fact['idCountry'] = df_fact['idCountry'].where(df_fact['idCountry'].notna(), df_fact['idCountry'])
+                    # fill where empty
+                    df_fact['country_code_norm'] = df_fact['country_code_norm'].where(df_fact['country_code_norm'] != '', df_fact['country_code'].fillna('').astype(str).str.strip().str.upper())
+
+                # Map to idCountry
+                df_fact['idCountry_mapped'] = df_fact['country_code_norm'].map(country_map)
+
+                # Coalesce into idCountry (preserve any existing idCountry)
+                if 'idCountry' in df_fact.columns:
+                    df_fact['idCountry'] = df_fact['idCountry'].where(df_fact['idCountry'].notna(), df_fact['idCountry_mapped'])
+                else:
+                    df_fact['idCountry'] = df_fact['idCountry_mapped']
+
+                # cleanup temp cols
+                df_fact = df_fact.drop(columns=[c for c in ['country_code_norm', 'idCountry_mapped'] if c in df_fact.columns])
             except Exception:
                 pass
     except Exception:
@@ -601,14 +616,30 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
             df_fact['idWarehouse'] = 0
 
     # ---------------------------
-    # Merge opcional: DIM_COUNTRY
+    # Merge opcional: DIM_COUNTRY (map source Country ISO2 -> idCountry only when missing)
     # ---------------------------
     if 'country' in dim_dfs:
-        if 'Country' in df_fact.columns:
-            df_fact = df_fact.merge(dim_dfs['country'][['idCountry', 'iso2']],
-                                    left_on='Country', right_on='iso2', how='left')
-        else:
-            df_fact['idCountry'] = None
+        try:
+            country_df = dim_dfs['country']
+            country_map = country_df[['iso2', 'idCountry']].drop_duplicates(subset=['iso2']).copy()
+            country_map['iso2'] = country_map['iso2'].astype(str).str.strip().str.upper()
+            country_map_dict = dict(zip(country_map['iso2'], country_map['idCountry']))
+
+            if 'Country' in df_fact.columns:
+                df_fact['Country_norm'] = df_fact['Country'].fillna('').astype(str).str.strip().str.upper()
+                if 'idCountry' in df_fact.columns:
+                    missing_mask = df_fact['idCountry'].isna()
+                    df_fact.loc[missing_mask, 'idCountry'] = df_fact.loc[missing_mask, 'Country_norm'].map(country_map_dict)
+                else:
+                    df_fact['idCountry'] = df_fact['Country_norm'].map(country_map_dict)
+                df_fact = df_fact.drop(columns=['Country_norm'])
+            else:
+                if 'idCountry' not in df_fact.columns:
+                    df_fact['idCountry'] = None
+        except Exception:
+            # leave idCountry as-is or None
+            if 'idCountry' not in df_fact.columns:
+                df_fact['idCountry'] = None
 
     # ---------------------------
     # Merge opcional: DIM_CURRENCY
