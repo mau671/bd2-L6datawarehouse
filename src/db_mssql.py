@@ -642,11 +642,34 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
                 df_fact['idCountry'] = None
 
     # ---------------------------
-    # Merge opcional: DIM_CURRENCY
+    # Merge opcional: DIM_CURRENCY (map DocCur -> idCurrency)
     # ---------------------------
-    if 'currency' in dim_dfs and 'DocCur' in df_fact.columns:
-        df_fact = df_fact.merge(dim_dfs['currency'][['idCurrency', 'code']],
-                                left_on='DocCur', right_on='code', how='left')
+    if 'currency' in dim_dfs:
+        try:
+            cur_df = dim_dfs['currency']
+            # normalize currency codes in currency dim
+            if 'code' in cur_df.columns:
+                cur_df['code'] = cur_df['code'].astype(str).str.strip().str.upper()
+
+            if 'DocCur' in df_fact.columns:
+                # normalize source DocCur and map
+                df_fact['DocCur_norm'] = df_fact['DocCur'].fillna('').astype(str).str.strip().str.upper()
+                # Map known source aliases to DW codes (e.g., COL -> CRC)
+                try:
+                    df_fact['DocCur_norm'] = df_fact['DocCur_norm'].replace({'COL': 'CRC'})
+                except Exception:
+                    pass
+                df_fact = df_fact.merge(cur_df[['idCurrency', 'code']].drop_duplicates(subset=['code']),
+                                        left_on='DocCur_norm', right_on='code', how='left')
+                # if idCurrency not produced, ensure column exists
+                if 'idCurrency' not in df_fact.columns:
+                    df_fact['idCurrency'] = None
+                # cleanup helper columns
+                df_fact = df_fact.drop(columns=[c for c in ['DocCur_norm', 'code'] if c in df_fact.columns])
+        except Exception:
+            # non-critical: leave idCurrency as-is or None
+            if 'idCurrency' not in df_fact.columns:
+                df_fact['idCurrency'] = None
 
     # ---------------------------
     # Selección de columnas finales
