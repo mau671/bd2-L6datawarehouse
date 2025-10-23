@@ -49,6 +49,11 @@ Ejecuta el siguiente comando dentro del entorno virtual:
 python -m pip install pandas numpy pyodbc sqlalchemy
 ```
 
+Ejecuta este comando para poder leer archivos excel
+```bash
+python -m pip install pandas numpy pyodbc sqlalchemy
+```
+
 ### ⚠️ Importante:
 Si este paso se ejecuta fuera del entorno virtual, las librerías se instalarán en el Python global, y tu script podría seguir mostrando errores de “módulo no encontrado”.
 
