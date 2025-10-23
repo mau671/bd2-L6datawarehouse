@@ -5,6 +5,7 @@ services:
     container_name: mssql_dw
     env_file:
       - ../../.env
+      - ../../.env.local
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: "${MSSQL_DW_SA_PASSWORD:-YourStrong@Passw0rd2}"
@@ -28,6 +29,9 @@ services:
     depends_on:
       mssql_dw:
         condition: service_healthy
+    env_file:
+      - ../../.env
+      - ../../.env.local
     environment:
       # load password from project .env via service env_file above
       MSSQL_SA_PASSWORD: "${MSSQL_DW_SA_PASSWORD:-YourStrong@Passw0rd2}"

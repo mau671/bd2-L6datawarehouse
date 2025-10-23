@@ -7,6 +7,7 @@ infra/backups/
 
 # Ignore environment files containing secrets
 .env
+.env.local
 
 # Ignore python virtual envs and caches
 .venv/

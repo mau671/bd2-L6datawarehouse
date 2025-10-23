@@ -5,6 +5,7 @@ services:
     container_name: mssql_source
     env_file:
       - ../../.env
+      - ../../.env.local
     environment:
       ACCEPT_EULA: "Y"
       MSSQL_SA_PASSWORD: "${MSSQL_SOURCE_SA_PASSWORD:-YourStrong@Passw0rd1}"
@@ -29,6 +30,9 @@ services:
     depends_on:
       mssql_source:
         condition: service_healthy
+    env_file:
+      - ../../.env
+      - ../../.env.local
     environment:
       # load password from project .env via service env_file above
       MSSQL_SA_PASSWORD: "${MSSQL_SOURCE_SA_PASSWORD:-YourStrong@Passw0rd1}"
