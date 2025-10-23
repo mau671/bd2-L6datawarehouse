@@ -47,6 +47,16 @@ Luego, para crear el entorno virtual y descargar las dependencias, ejecutar:
 uv sync
 ```
 
+Ademas se debe instalar ODBC Driver 18 for SQL Server siguiendo las instrucciones oficiales de Microsoft para [Linux](https://docs.microsoft.com/en-us/sql/connect/odbc/linux-mac/installing-the-microsoft-odbc-driver-for-sql-server) o [Windows](https://docs.microsoft.com/en-us/sql/connect/odbc/windows/microsoft-odbc-driver-for-sql-server-on-windows).
+
+## Ejecutar ETL
+
+```
+uv run main.py --reset
+```
+
+--reset : elimina y recrea las bases de datos, luego ejecuta el ETL completo.
+
 Crear red interna (una sola vez):
 
 ```bash
