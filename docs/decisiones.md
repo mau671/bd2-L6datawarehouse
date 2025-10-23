@@ -24,9 +24,3 @@
 
 - El ETL desde Excel (o CSV homólogo) completa `DIM_TIME` generando `idDate`, `year`, `month`, `day`, `quarter`, `month_name` y la columna `tc_usd_crc`.
 - Después de poblar la dimensión, la función `convert_currency_fact_sales` recalcula `total_crc` para filas con monto en USD y tipo de cambio disponible.
-
-## TODO
-
-- [ ] Volver a ejecutar el ETL de tipos de cambio con el archivo definitivo (`TiposCambio_USD_CRC_2024_2025.csv`) para poblar `tc_usd_crc` en la nueva estructura.
-- [ ] Validar con datos reales que todos los clientes quedaron asociados a un país y revisar posibles valores nulos en `idCountry`.
-- [ ] Ejecutar `run_etl` y `ETL_Json` tras limpiar las tablas para confirmar que la unificación de scripts no rompe la carga incremental.
