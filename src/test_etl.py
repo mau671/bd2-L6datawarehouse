@@ -1,6 +1,6 @@
 #ARCHIVO PARA TESTEAR RESULTADOS SE EJECUTARÍA DESPUES DE ETLS
 import pyodbc
-from db_config import (  DW_CONN_STR, connect_to_db )
+from src.db_config import DW_CONN_STR
 
 
 def main():

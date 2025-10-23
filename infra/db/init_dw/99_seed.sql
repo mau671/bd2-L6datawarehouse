@@ -9,5 +9,5 @@ IF NOT EXISTS (SELECT 1 FROM dw.DIM_CURRENCY WHERE code='CRC') INSERT INTO dw.DI
 -- El JSON trae ventas mensuales solo en USD y sin cliente, así que lo homologamos con 'AGG_JSON'
 -- y asumimos día 1 del mes correspondiente al cargar al DW.
 IF NOT EXISTS (SELECT 1 FROM dw.DIM_CUSTOMERS WHERE cardCode='AGG_JSON')
-INSERT INTO dw.DIM_CUSTOMERS(cardCode,[name],zona) VALUES ('AGG_JSON','Ventas agregadas JSON','AGG');
+INSERT INTO dw.DIM_CUSTOMERS(cardCode,[name],zona,idCountry) VALUES ('AGG_JSON','Ventas agregadas JSON','AGG',NULL);
 GO

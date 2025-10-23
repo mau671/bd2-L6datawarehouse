@@ -4,7 +4,7 @@ import datetime as dt
 from decimal import Decimal, ROUND_HALF_UP
 import pyodbc
 import pandas as pd
-from db_config import ( DW_CONN_STR, connect_to_db )
+from src.db_config import DW_CONN_STR, connect_to_db
 
 #DW_CONN_STR = "Driver={ODBC Driver 18 for SQL Server};Server=YOUR_SERVER;Database=YOUR_DW;Trusted_Connection=yes;"  # <- ajusta
 
@@ -16,11 +16,12 @@ SYNTH_BRAND = "AGG_JSON"
 USD_CODE = "USD"
 
 # ---------- helpers ----------
-def as_decimal(x, scale=10):
-    if x is None:
+def as_decimal(x, scale=6):
+    if x is None or pd.isna(x):
         return None
-    d = Decimal(str(x))
-    return d.quantize(Decimal("1." + "0"*scale), rounding=ROUND_HALF_UP)
+    d = x if isinstance(x, Decimal) else Decimal(str(x))
+    quant = Decimal("1." + "0" * scale)
+    return d.quantize(quant, rounding=ROUND_HALF_UP)
 
 def yyyymmdd(d: dt.date) -> int:
     return d.year*10000 + d.month*100 + d.day
@@ -34,8 +35,6 @@ def get_conn():
 
 # ---------- lecturas DW a memoria ----------
 def fetch_dim_maps(conn):
-    maps = {}
-
     def read_df(sql, key):
         try:
             return pd.read_sql(sql, conn)
@@ -45,8 +44,8 @@ def fetch_dim_maps(conn):
     dfs = {}
     dfs["currency"] = read_df("SELECT idCurrency AS id, code FROM dw.DIM_CURRENCY", "code")
     dfs["product"]  = read_df("SELECT idProduct AS id, itemCode, name FROM dw.DIM_PRODUCTS", "itemCode")
-    dfs["customer"] = read_df("SELECT idCustomer AS id, cardCode, name FROM dw.DIM_CUSTOMERS", "cardCode")
-    dfs["time"]     = read_df("SELECT idDate AS id, date, tc_usd_crc FROM dw.DIM_TIME", "date")
+    dfs["customer"] = read_df("SELECT idCustomer AS id, cardCode, name, idCountry FROM dw.DIM_CUSTOMERS", "cardCode")
+    dfs["time"]     = read_df("SELECT idDate AS id, date, year, month, day, quarter, month_name, tc_usd_crc FROM dw.DIM_TIME", "date")
 
     return dfs
 
@@ -66,15 +65,19 @@ def ensure_customer_json(conn, df_customer):
         return int(df_customer.loc[df_customer["cardCode"] == SYNTH_CUSTOMER_CODE, "id"].iloc[0])
     cursor = conn.cursor()
     query = """
-            INSERT INTO dw.DIM_CUSTOMERS(cardCode, name, zona)
+            INSERT INTO dw.DIM_CUSTOMERS(cardCode, name, zona, idCountry)
             OUTPUT INSERTED.idCustomer
-            VALUES (?, ?, ?);
+            VALUES (?, ?, ?, NULL);
         """
     cursor.execute(query, SYNTH_CUSTOMER_CODE, SYNTH_CUSTOMER_NAME, SYNTH_CUSTOMER_ZONA)
     new_id = int(cursor.fetchone()[0])
-    print(new_id)
     id_cust = int(new_id)
-    df_customer.loc[len(df_customer)] = [id_cust, SYNTH_CUSTOMER_CODE, SYNTH_CUSTOMER_NAME]
+    df_customer.loc[len(df_customer)] = {
+        "id": id_cust,
+        "cardCode": SYNTH_CUSTOMER_CODE,
+        "name": SYNTH_CUSTOMER_NAME,
+        "idCountry": None,
+    }
     return id_cust
 
 def ensure_products(conn, df_products_dim, items_from_json):
@@ -111,7 +114,13 @@ def ensure_time_rows(conn, df_time_dim, dates_needed):
     """
     cursor = conn.cursor()
     # index rápido de los que ya están
-    present = {pd.to_datetime(r["date"]).date(): (int(r["id"]), r.get("tc_usd_crc", None)) for _, r in df_time_dim.iterrows()}
+    present = {
+        pd.to_datetime(r["date"]).date(): (
+            int(r["id"]),
+            r.get("tc_usd_crc", None)
+        )
+        for _, r in df_time_dim.iterrows()
+    }
     out = {}
 
     for d in sorted(dates_needed):
@@ -119,13 +128,15 @@ def ensure_time_rows(conn, df_time_dim, dates_needed):
             out[d] = present[d]
             continue
         idDate = yyyymmdd(d)
+        quarter = ((d.month - 1) // 3) + 1
+        month_name = d.strftime("%B")
         cursor.execute(
-            "INSERT INTO dw.DIM_TIME(idDate, date, year, month) VALUES (?, ?, ?, ?);",
-            idDate, d, d.year, d.month
+            "INSERT INTO dw.DIM_TIME(idDate, date, year, month, day, quarter, month_name, tc_usd_crc) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+            idDate, d, d.year, d.month, d.day, quarter, month_name, None
         )
         out[d] = (idDate, None)
         # agrega también al df en memoria
-        df_time_dim.loc[len(df_time_dim)] = [idDate, pd.Timestamp(d), None]
+        df_time_dim.loc[len(df_time_dim)] = [idDate, pd.Timestamp(d), d.year, d.month, d.day, quarter, month_name, None]
 
     return out
 
@@ -150,24 +161,36 @@ def build_fact_rows(json_path, idCustomer_json, idCurrency_usd, time_index, prod
             total_usd = qty * price
             idProduct = prod_map[item]
 
+            quantity_dec = as_decimal(qty, scale=6)
+            total_usd_dec = as_decimal(total_usd, scale=6)
+
+            total_crc_dec = None
+            if tc not in (None, "") and not pd.isna(tc):
+                try:
+                    tc_float = float(tc)
+                except (TypeError, ValueError):
+                    tc_float = None
+                if tc_float not in (None, 0.0):
+                    total_crc_val = Decimal(str(total_usd)) * Decimal(str(tc_float))
+                    total_crc_dec = as_decimal(total_crc_val, scale=6)
+
             rows.append({
                 "idDate": int(idDate),
                 "idCustomer": int(idCustomer_json),
                 "idProduct": int(idProduct),
                 "idSalesperson": None,
                 "idWarehouse": 0,         # UNK por compatibilidad
-                "idCountry": None,
                 "idCurrency": int(idCurrency_usd),
-                "quantity": as_decimal(qty),
-                "total_usd": as_decimal(total_usd),
-                "total_crc": (as_decimal(total_usd * float(tc)) if tc not in (None, "", 0) else None),
+                "quantity": quantity_dec,
+                "total_usd": total_usd_dec,
+                "total_crc": total_crc_dec,
                 "source_system": SOURCE_SYSTEM,
                 "source_doc_id": f"{year:04d}-{month:02d}-{item}",
             })
 
     # orden de columnas estándar
-    cols = ["idDate","idCustomer","idProduct","idSalesperson","idWarehouse","idCountry",
-            "idCurrency","quantity","total_usd","total_crc","source_system","source_doc_id"]
+    cols = ["idDate","idCustomer","idProduct","idSalesperson","idWarehouse",
+        "idCurrency","quantity","total_usd","total_crc","source_system","source_doc_id"]
     df = pd.DataFrame(rows, columns=cols)
     return df
 
@@ -191,7 +214,6 @@ def load_fact_sales(conn, df_fact):
             int(r["idProduct"]),
             (None if pd.isna(r["idSalesperson"]) else int(r["idSalesperson"])),
             int(r["idWarehouse"]),
-            (None if pd.isna(r["idCountry"]) else int(r["idCountry"])),
             int(r["idCurrency"]),
             r["quantity"], r["total_usd"], r["total_crc"],
             r["source_system"], r["source_doc_id"]
@@ -199,13 +221,20 @@ def load_fact_sales(conn, df_fact):
 
     sql = """
     INSERT INTO dw.FACT_SALES
-    (idDate, idCustomer, idProduct, idSalesperson, idWarehouse, idCountry, idCurrency,
+    (idDate, idCustomer, idProduct, idSalesperson, idWarehouse, idCurrency,
      quantity, total_usd, total_crc, source_system, source_doc_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
     cursor = conn.cursor()
     cursor.fast_executemany = True
     cursor.executemany(sql, tuples)
+
+
+def clear_existing_facts(conn):
+    """Elimina los hechos previos de este ETL para evitar duplicados."""
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM dw.FACT_SALES WHERE source_system = ?", SOURCE_SYSTEM)
+    return cursor.rowcount
 
 # ---------- main ----------
 def run(json_path="../data/raw/ventas_resumen_2024_2025.json"):
@@ -232,12 +261,16 @@ def run(json_path="../data/raw/ventas_resumen_2024_2025.json"):
         # construir DF de hechos
         df_fact = build_fact_rows(json_path, idCustomer_json, idCurrency_usd, time_index, prod_map)
 
+        cleared = clear_existing_facts(conn)
+        if cleared:
+            print(f"Limpieza previa: {cleared} filas eliminadas de dw.FACT_SALES para {SOURCE_SYSTEM}.")
+
         # cargar
         load_fact_sales(conn, df_fact)
 
         conn.commit()
         print(f"Cargadas {len(df_fact)} filas a dw.FACT_SALES desde {json_path}.")
-    except Exception as e:
+    except Exception:
         conn.rollback()
         raise
     finally:

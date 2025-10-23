@@ -1,12 +1,13 @@
 import pyodbc
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from db_config import (  SOURCE_CONN_STR, DW_CONN_STR, connect_to_db )
-from db_create_tables import create_dw_schema
+from src.db_config import SOURCE_CONN_STR, DW_CONN_STR, connect_to_db
+from src.db_create_tables import create_dw_schema
 import warnings
 import traceback
 from decimal import Decimal, InvalidOperation
+
+SOURCE_SYSTEM_DB = "DB_SALES"
 
 # Control verbose output globally. Set to False to suppress informational prints.
 VERBOSE = False
@@ -25,168 +26,179 @@ warnings.filterwarnings(
 # ====================================================================
 
 
+def ensure_unknown_warehouse(dw_conn):
+    """Garantiza la existencia de la bodega desconocida (SK 0)."""
+
+    cursor = dw_conn.cursor()
+    cursor.execute(
+        """
+        IF NOT EXISTS (SELECT 1 FROM dw.DIM_WAREHOUSE WHERE whsCode = 'UNK')
+        BEGIN
+            SET IDENTITY_INSERT dw.DIM_WAREHOUSE ON;
+            INSERT INTO dw.DIM_WAREHOUSE (idWarehouse, whsCode, [name])
+            VALUES (0, 'UNK', 'Bodega Desconocida');
+            SET IDENTITY_INSERT dw.DIM_WAREHOUSE OFF;
+        END
+        """
+    )
+    dw_conn.commit()
+
+
 def process_and_load_dim(df_source, source_key, dim_name, dw_conn, dw_table):
-    """
-    Genera SK, maneja 'UNK' para WAREHOUSE, mapea columnas y carga la dimensión
-    al DW, respetando las propiedades IDENTITY y la convención de nombres.
-    """
-    
-    # 1. Determinación de la Clave Sustituta (SK)
-    
-    if dw_table == 'DIM_TIME':
-        sk_column_name = 'idDate'
-    else:
-        sk_column_name = f'id{dim_name.capitalize()}'
-    
-    # 2. Lógica de UNK y Generación de SK
-    
-    if dw_table == 'DIM_WAREHOUSE':
-        
-        # 2a. Normalizar el nombre de la columna de nombre a 'name'
-        if 'WhsName' in df_source.columns:
-             df_source = df_source.rename(columns={'WhsName': 'name'})
-        else:
-             df_source['name'] = df_source[source_key]
-             
-        # 2b. Crear la fila 'UNK'
-        unknown_row = pd.DataFrame({
-            sk_column_name: [0], 
-            source_key: ['UNK'], 
-            'name': ['Bodega Desconocida']
-        })
-        
-        # 2c. Filtrar el df_source a las claves de negocio y concatenar
-        df_source_filtered = df_source[[source_key, 'name']].drop_duplicates()
-        
-        df_lookup = pd.concat([unknown_row, df_source_filtered], ignore_index=True)
-        df_lookup[sk_column_name] = df_lookup.index
-        
-        df_source = df_lookup # df_source ahora tiene idWarehouse
+    """Carga incremental de dimensiones y devuelve el mapa de claves."""
 
-    else:
-        # Lógica para las demás dimensiones.
-        # - Para DIM_TIME debemos PRESERVAR la SK (idDate) que viene del origen
-        #   (es un entero YYYYMMDD). No generar un id secuencial.
-        # - Para las demás dimensiones con IDENTITY generamos SK secuencial.
-        if dw_table == 'DIM_TIME':
-            # Asegurarnos de que la columna idDate exista y tenga el formato correcto
-            df_source = df_source.reset_index(drop=True)
-            if sk_column_name not in df_source.columns:
-                # Si no existe, intentar inferirla desde la columna 'date'
-                if 'date' in df_source.columns:
-                    df_source[sk_column_name] = df_source['date'].dt.strftime('%Y%m%d').astype(int)
-                else:
-                    # Crear una SK secuencial como último recurso
-                    df_source[sk_column_name] = (df_source.index + 1)
-        else:
-            # Generar SK para dimensiones con IDENTITY (idCustomer, idProduct, ...)
-            if sk_column_name in df_source.columns:
-                df_source = df_source.drop(columns=[sk_column_name])
+    if df_source is None:
+        df_source = pd.DataFrame()
 
-            df_source = df_source.reset_index(drop=True)
-            df_source[sk_column_name] = (df_source.index + 1)
+    sk_columns = {
+        'DIM_TIME': 'idDate',
+        'DIM_CUSTOMERS': 'idCustomer',
+        'DIM_PRODUCTS': 'idProduct',
+        'DIM_SALESPERSON': 'idSalesperson',
+        'DIM_WAREHOUSE': 'idWarehouse',
+        'DIM_COUNTRY': 'idCountry',
+        'DIM_CURRENCY': 'idCurrency',
+    }
 
-    
-    # 3. Preparación de Carga y Mapeo Estricto de Columnas
-    
-    df_to_load = df_source.copy()
-    
-    # Definir las columnas esperadas en el DW (ESTRICTO y en el orden de inserción)
+    canonical_keys = {
+        'DIM_CUSTOMERS': 'cardCode',
+        'DIM_PRODUCTS': 'itemCode',
+        'DIM_SALESPERSON': 'spCode',
+        'DIM_WAREHOUSE': 'whsCode',
+        'DIM_COUNTRY': 'iso2',
+        'DIM_CURRENCY': 'code',
+        'DIM_TIME': 'idDate',
+    }
+
     expected_cols = {
-        'DIM_TIME': ['idDate', 'date', 'year', 'month', 'tc_usd_crc'],
-        'DIM_WAREHOUSE': ['idWarehouse', 'whsCode', 'name'], 
-        'DIM_CUSTOMERS': ['cardCode', 'name', 'zona'],
+        'DIM_TIME': ['idDate', 'date', 'year', 'month', 'day', 'quarter', 'month_name', 'tc_usd_crc'],
+        'DIM_WAREHOUSE': ['whsCode', 'name'],
+        'DIM_CUSTOMERS': ['cardCode', 'name', 'zona', 'idCountry'],
         'DIM_PRODUCTS': ['itemCode', 'name', 'brand'],
         'DIM_SALESPERSON': ['spCode', 'name'],
         'DIM_COUNTRY': ['iso2', 'name'],
-        'DIM_CURRENCY': ['code', 'name']
+        'DIM_CURRENCY': ['code', 'name'],
     }
-    
-    # Mapeo y renombre explícito (para coincidir con el esquema dw.)
+
+    lookup_columns = {
+        'DIM_TIME': ['idDate', 'date', 'tc_usd_crc'],
+        'DIM_CUSTOMERS': ['idCustomer', 'cardCode', 'idCountry', 'zona'],
+        'DIM_PRODUCTS': ['idProduct', 'itemCode', 'brand'],
+        'DIM_SALESPERSON': ['idSalesperson', 'spCode'],
+        'DIM_WAREHOUSE': ['idWarehouse', 'whsCode'],
+        'DIM_COUNTRY': ['idCountry', 'iso2'],
+        'DIM_CURRENCY': ['idCurrency', 'code'],
+    }
+
+    string_key_tables = {'DIM_CUSTOMERS', 'DIM_PRODUCTS', 'DIM_SALESPERSON', 'DIM_WAREHOUSE', 'DIM_COUNTRY', 'DIM_CURRENCY'}
+
+    key_col = canonical_keys.get(dw_table, source_key)
+    sk_col = sk_columns.get(dw_table)
+    expected = expected_cols.get(dw_table, [])
+
+    if dw_table == 'DIM_WAREHOUSE':
+        ensure_unknown_warehouse(dw_conn)
+
+    df_work = df_source.copy()
+
+    # Normalizar nombres de columnas según la dimensión
     if dw_table == 'DIM_CUSTOMERS':
-        df_to_load = df_to_load.rename(columns={'CardCode': 'cardCode', 'zone_name': 'zona'})
+        df_work = df_work.rename(columns={'CardCode': 'cardCode', 'zone_name': 'zona'})
     elif dw_table == 'DIM_PRODUCTS':
-        df_to_load = df_to_load.rename(columns={'ItemCode': 'itemCode', 'brand_name': 'brand'})
+        df_work = df_work.rename(columns={'ItemCode': 'itemCode', 'brand_name': 'brand'})
     elif dw_table == 'DIM_SALESPERSON':
-        df_to_load = df_to_load.rename(columns={'SlpCode': 'spCode', 'SlpName': 'name'})
+        df_work = df_work.rename(columns={'SlpCode': 'spCode', 'SlpName': 'name'})
     elif dw_table == 'DIM_COUNTRY':
-        df_to_load = df_to_load.rename(columns={'Country': 'iso2', 'Name': 'name'})
+        df_work = df_work.rename(columns={'Country': 'iso2', 'Name': 'name'})
     elif dw_table == 'DIM_WAREHOUSE':
-        df_to_load = df_to_load.rename(columns={'WhsCode': 'whsCode'})
+        df_work = df_work.rename(columns={'WhsCode': 'whsCode', 'WhsName': 'name'})
     elif dw_table == 'DIM_TIME':
+        if 'date' in df_work.columns:
+            df_work['date'] = pd.to_datetime(df_work['date'], errors='coerce')
+        if 'tc_usd_crc' not in df_work.columns:
+            df_work['tc_usd_crc'] = np.nan
+        if 'day' not in df_work.columns and 'date' in df_work.columns:
+            df_work['day'] = df_work['date'].dt.day
+        if 'quarter' not in df_work.columns and 'date' in df_work.columns:
+            df_work['quarter'] = df_work['date'].dt.quarter
+        if 'month_name' not in df_work.columns and 'date' in df_work.columns:
+            df_work['month_name'] = df_work['date'].dt.strftime('%B')
+        if 'month' not in df_work.columns and 'date' in df_work.columns:
+            df_work['month'] = df_work['date'].dt.month
+        if 'year' not in df_work.columns and 'date' in df_work.columns:
+            df_work['year'] = df_work['date'].dt.year
+        if 'idDate' not in df_work.columns and 'date' in df_work.columns:
+            df_work['idDate'] = df_work['date'].dt.strftime('%Y%m%d').astype(int)
 
-        if 'tc_usd_crc' not in df_to_load.columns:
-            df_to_load['tc_usd_crc'] = np.nan
-        
-    # Filtrar estrictamente solo las columnas del DW
-    cols_to_keep = expected_cols.get(dw_table, [])
-    
-    df_to_load = df_to_load[[col for col in cols_to_keep if col in df_to_load.columns]].copy()
+    # Asegurar columnas esperadas
+    for col in expected:
+        if col not in df_work.columns:
+            df_work[col] = np.nan
 
-    # 4. Carga al DW (Manejo de IDENTITY)
+    if expected:
+        df_work = df_work[expected].copy()
+
+    if key_col not in df_work.columns:
+        # no hay datos nuevos para esta dimensión
+        existing = pd.read_sql(f"SELECT {', '.join(lookup_columns.get(dw_table, [sk_col, key_col]))} FROM dw.{dw_table}", dw_conn)
+        return existing
+
+    df_work = df_work[df_work[key_col].notna()].drop_duplicates(subset=[key_col])
+
+    def normalize(series):
+        if series.dtype == object or series.dtype == 'O':
+            return series.fillna('').astype(str).str.strip().str.upper()
+        return series
+
     try:
-        cursor = dw_conn.cursor()
-        
-        cols = ', '.join(df_to_load.columns)
-        placeholders = ', '.join(['?' for _ in df_to_load.columns])
+        existing_keys_df = pd.read_sql(f"SELECT {key_col} FROM dw.{dw_table}", dw_conn)
+    except Exception:
+        existing_keys_df = pd.DataFrame(columns=[key_col])
 
-        if dw_table == 'DIM_WAREHOUSE':
+    existing_keys = set(normalize(existing_keys_df[key_col]).tolist()) if not existing_keys_df.empty and dw_table in string_key_tables else set(existing_keys_df[key_col].tolist())
 
-            insert_sql = (
-                f"SET IDENTITY_INSERT dw.{dw_table} ON; "
-                f"INSERT INTO dw.{dw_table} ({cols}) VALUES ({placeholders}); "
-                f"SET IDENTITY_INSERT dw.{dw_table} OFF;"
-            )
-        elif dw_table == 'DIM_TIME':
-      
-            # DIM_TIME: Sin IDENTITY, se inserta la SK
-            insert_sql = f"INSERT INTO dw.{dw_table} ({cols}) VALUES ({placeholders})"
-        else: 
-            # Tablas con IDENTITY(1,1): La SK se excluyó de 'cols', por lo que SQL Server la genera.
-            insert_sql = f"INSERT INTO dw.{dw_table} ({cols}) VALUES ({placeholders})"
-        
-        cursor.fast_executemany = True
-        data_to_insert = [tuple(row) for row in df_to_load.values]
-        cursor.executemany(insert_sql, data_to_insert)
-        dw_conn.commit()
-        print(f"Dimensión {dw_table} cargada. Registros: {len(data_to_insert)}")
-        
-    except pyodbc.Error as e:
-        # El error 2601 (duplicate key) es un error de datos y se reporta como advertencia.
-        print(f"ADVERTENCIA: Falló la simulación de carga para {dw_table}. Error DB: {e.args[0]}")
-        dw_conn.rollback()
-    except Exception as e:
-        print(f"ADVERTENCIA: Falló la simulación de carga para {dw_table}. Error Python: {e}")
-        dw_conn.rollback()
-
-    # 5. Retornar el mapa de lookup
-    # Evitar devolver dos columnas con el mismo nombre (p. ej. idDate,idDate)
-    if sk_column_name == source_key:
-        # Devolver solo la SK si la clave de negocio es la misma
-        ret = df_source[[sk_column_name]].drop_duplicates()
-        return ret
+    if dw_table in string_key_tables:
+        comparison_series = normalize(df_work[key_col])
     else:
-        # Devolver mapa SK <-> business_key
-        cols = [sk_column_name, source_key]
-        cols = [c for c in cols if c in df_source.columns]
-        ret = df_source[cols].drop_duplicates(subset=[source_key])
+        comparison_series = df_work[key_col]
 
-        # Normalizar el nombre de la columna de clave de negocio para un uso consistente
-        canonical_names = {
-            'DIM_CUSTOMERS': 'cardCode',
-            'DIM_PRODUCTS': 'itemCode',
-            'DIM_WAREHOUSE': 'whsCode',
-            'DIM_SALESPERSON': 'spCode',
-            'DIM_COUNTRY': 'iso2',
-            'DIM_CURRENCY': 'code',
-            'DIM_TIME': 'vDate'
-        }
+    new_mask = ~comparison_series.isin(existing_keys)
+    df_to_insert = df_work[new_mask].copy()
 
-        canonical = canonical_names.get(dw_table)
-        if canonical and source_key != canonical and source_key in ret.columns:
-            ret = ret.rename(columns={source_key: canonical})
+    # Preparar columnas a insertar (sin la clave sustituta para tablas con IDENTITY)
+    insert_columns = df_to_insert.columns.tolist()
+    if df_to_insert.empty:
+        pass
+    else:
+        if dw_table != 'DIM_TIME' and sk_col in insert_columns:
+            insert_columns.remove(sk_col)
 
-        return ret
+        cursor = dw_conn.cursor()
+        placeholders = ', '.join(['?' for _ in insert_columns])
+        columns_sql = ', '.join(insert_columns)
+        insert_sql = f"INSERT INTO dw.{dw_table} ({columns_sql}) VALUES ({placeholders})"
+
+        cursor.fast_executemany = True
+        payload = []
+        for _, row in df_to_insert.iterrows():
+            values = []
+            for col in insert_columns:
+                val = row[col]
+                if isinstance(val, np.generic):
+                    val = val.item()
+                values.append(val)
+            payload.append(tuple(values))
+
+        if payload:
+            cursor.executemany(insert_sql, payload)
+            dw_conn.commit()
+            if VERBOSE:
+                print(f"Dimensión {dw_table}: {len(payload)} nuevos registros insertados")
+
+    # Recuperar el mapa completo desde el DW
+    select_cols = lookup_columns.get(dw_table, [sk_col, key_col])
+    lookup_df = pd.read_sql(f"SELECT {', '.join(select_cols)} FROM dw.{dw_table}", dw_conn)
+    return lookup_df
 
 # ====================================================================
 # 2. FUNCIÓN DE EXTRACCIÓN (Extract - E)
@@ -379,24 +391,22 @@ def load_dimensions(dw_conn, source_data):
     except Exception:
         pass
 
+    try:
+        country_lookup = dim_dfs.get('country')
+        if isinstance(country_lookup, pd.DataFrame) and 'iso2' in country_lookup.columns:
+            iso_map = country_lookup[['iso2', 'idCountry']].drop_duplicates(subset=['iso2']).copy()
+            iso_map['iso2'] = iso_map['iso2'].astype(str).str.strip().str.upper()
+            country_map = dict(zip(iso_map['iso2'], iso_map['idCountry']))
+            df_customers['idCountry'] = df_customers.get('country_code', np.nan)
+            df_customers['idCountry'] = df_customers['idCountry'].fillna('').astype(str).str.strip().str.upper().map(country_map)
+        else:
+            df_customers['idCountry'] = np.nan
+    except Exception:
+        df_customers['idCountry'] = np.nan
+
     dim_dfs['customer'] = process_and_load_dim(
         df_customers, 'CardCode', 'customer', dw_conn, 'DIM_CUSTOMERS'
     )
-    # Enrich the returned customer lookup with country_code so we can resolve idCountry later
-    try:
-        if isinstance(dim_dfs.get('customer'), pd.DataFrame):
-            # Ensure df_customers exposes a 'cardCode' column to match the canonical name
-            if 'CardCode' in df_customers.columns and 'cardCode' not in df_customers.columns:
-                df_customers['cardCode'] = df_customers['CardCode']
-            # If the customer lookup has 'cardCode' and df_customers has 'country_code', merge them
-            if 'cardCode' in dim_dfs['customer'].columns and 'country_code' in df_customers.columns:
-                dim_dfs['customer'] = dim_dfs['customer'].merge(
-                    df_customers[['cardCode', 'country_code']].drop_duplicates(subset=['cardCode']),
-                    on='cardCode', how='left'
-                )
-    except Exception:
-        # non-critical: if enrichment fails, continue without country_code in customer lookup
-        pass
 
     # G. DIM_TIME (idDate)
     # NOTE: Per user request, we skip populating DIM_TIME in the DW. Instead,
@@ -437,6 +447,17 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
     if df_fact is None:
         raise TypeError("load_fact_sales expected 'source_data' to contain a pandas.DataFrame for sales facts (key 'sales_fact').")
 
+    # Limpiar previamente los hechos de este sistema de origen para evitar duplicados
+    try:
+        cleanup_cursor = dw_conn.cursor()
+        cleanup_cursor.execute("DELETE FROM dw.FACT_SALES WHERE source_system = ?", SOURCE_SYSTEM_DB)
+        dw_conn.commit()
+    except Exception as cleanup_err:
+        dw_conn.rollback()
+        raise RuntimeError(f"No se pudo limpiar FACT_SALES para {SOURCE_SYSTEM_DB}: {cleanup_err}")
+
+    df_fact['source_system'] = SOURCE_SYSTEM_DB
+
     # ---------------------------
     # DIM_TIME: derive idDate directly from DocDate (user requested to skip DIM_TIME table)
     # ---------------------------
@@ -464,14 +485,23 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
     # ---------------------------
     # Normalize keys (strip/upper) to improve join matching
     def normalize_series(s):
-        if s.dtype == object:
-            return s.fillna('').astype(str).str.strip().str.upper()
-        return s
+        series = s.astype(str)
+        series = series.replace({'nan': '', 'None': '', 'NaT': ''})
+        return series.str.strip().str.upper()
 
     # Normalize df_fact key columns
     for kc in ['CardCode', 'ItemCode', 'WhsCode', 'SlpCode']:
         if kc in df_fact.columns:
             df_fact[kc] = normalize_series(df_fact[kc])
+
+    if 'LineTotal' in df_fact.columns:
+        df_fact['LineTotal'] = pd.to_numeric(df_fact['LineTotal'], errors='coerce')
+    if 'Quantity' in df_fact.columns:
+        df_fact['Quantity'] = pd.to_numeric(df_fact['Quantity'], errors='coerce')
+    if 'Quantity' in df_fact.columns:
+        df_fact['Quantity'] = pd.to_numeric(df_fact['Quantity'], errors='coerce')
+    df_fact['total_usd'] = np.nan
+    df_fact['total_crc'] = np.nan
 
     # Normalize lookup keys in dim_dfs
     if 'customer' in dim_dfs and isinstance(dim_dfs['customer'], pd.DataFrame):
@@ -486,91 +516,8 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
         if 'CardCode' in df_fact.columns and 'cardCode' in df_fact.columns:
             df_fact = df_fact.merge(dim_dfs.get('customer', pd.DataFrame()), left_on='CardCode', right_on='cardCode', how='left')
 
-    # --- Attempt to derive idCountry via the customer lookup's country_code when source fact has no Country column ---
-    try:
-        if 'customer' in dim_dfs and isinstance(dim_dfs['customer'], pd.DataFrame):
-            # if the customer lookup contains country_code, bring it into df_fact using idCustomer
-            if 'country_code' in dim_dfs['customer'].columns and 'idCustomer' in df_fact.columns:
-                # normalize country codes
-                try:
-                    dim_dfs['customer']['country_code'] = dim_dfs['customer']['country_code'].astype(str).str.strip().str.upper()
-                except Exception:
-                    pass
-                df_fact = df_fact.merge(dim_dfs['customer'][['idCustomer', 'country_code']], on='idCustomer', how='left')
-                # now map country_code (iso2) to idCountry using dim_dfs['country'] if available
-                if 'country' in dim_dfs and isinstance(dim_dfs['country'], pd.DataFrame):
-                    try:
-                        dim_dfs['country']['iso2'] = dim_dfs['country']['iso2'].astype(str).str.strip().str.upper()
-                    except Exception:
-                        pass
-                    df_fact = df_fact.merge(dim_dfs['country'][['idCountry', 'iso2']], left_on='country_code', right_on='iso2', how='left')
-                    # If merge produced idCountry from right side, keep it. If not, ensure column exists
-                    if 'idCountry' not in df_fact.columns:
-                        df_fact['idCountry'] = None
-    except Exception:
-        # non-critical: leave idCountry as-is or None
-        pass
-
-    # Propagate country information from the customer lookup into the fact, then map to idCountry
-    try:
-        cust_df = dim_dfs.get('customer')
-        country_df = dim_dfs.get('country')
-        # Merge country_code from customer lookup using idCustomer (if present)
-        if isinstance(cust_df, pd.DataFrame) and 'country_code' in cust_df.columns and 'idCustomer' in df_fact.columns:
-            df_fact = df_fact.merge(
-                cust_df[['idCustomer', 'country_code']].drop_duplicates(subset=['idCustomer']),
-                on='idCustomer', how='left'
-            )
-
-        # Also attempt to merge country_code by business CardCode (safer if idCustomer was missing)
-        if isinstance(cust_df, pd.DataFrame) and 'cardCode' in cust_df.columns and 'CardCode' in df_fact.columns:
-            # normalize both sides for matching
-            try:
-                df_fact['CardCode_norm'] = df_fact['CardCode'].fillna('').astype(str).str.strip().str.upper()
-                cust_codes = cust_df[['cardCode', 'country_code']].drop_duplicates(subset=['cardCode']).copy()
-                cust_codes['cardCode'] = cust_codes['cardCode'].fillna('').astype(str).str.strip().str.upper()
-                df_fact = df_fact.merge(cust_codes, left_on='CardCode_norm', right_on='cardCode', how='left', suffixes=('', '_from_card'))
-                # coalesce any country_code values
-                if 'country_code' in df_fact.columns and 'country_code_from_card' in df_fact.columns:
-                    df_fact['country_code'] = df_fact['country_code'].fillna(df_fact['country_code_from_card'])
-                    df_fact = df_fact.drop(columns=['country_code_from_card', 'cardCode'])
-                # drop helper
-                df_fact = df_fact.drop(columns=['CardCode_norm'])
-            except Exception:
-                pass
-
-        # Now map country_code (ISO2) to idCountry using country dim (use mapping to avoid merge-suffix issues)
-        if isinstance(country_df, pd.DataFrame) and 'iso2' in country_df.columns:
-            try:
-                # build map iso2 -> idCountry
-                tmp = country_df[['iso2', 'idCountry']].drop_duplicates(subset=['iso2']).copy()
-                tmp['iso2'] = tmp['iso2'].astype(str).str.strip().str.upper()
-                country_map = dict(zip(tmp['iso2'], tmp['idCountry']))
-
-                # Determine effective country code for each fact row: prefer source 'Country', else 'country_code' from customer
-                df_fact['country_code_norm'] = ''
-                if 'Country' in df_fact.columns:
-                    df_fact['country_code_norm'] = df_fact['Country'].fillna('').astype(str).str.strip().str.upper()
-                if 'country_code' in df_fact.columns:
-                    # fill where empty
-                    df_fact['country_code_norm'] = df_fact['country_code_norm'].where(df_fact['country_code_norm'] != '', df_fact['country_code'].fillna('').astype(str).str.strip().str.upper())
-
-                # Map to idCountry
-                df_fact['idCountry_mapped'] = df_fact['country_code_norm'].map(country_map)
-
-                # Coalesce into idCountry (preserve any existing idCountry)
-                if 'idCountry' in df_fact.columns:
-                    df_fact['idCountry'] = df_fact['idCountry'].where(df_fact['idCountry'].notna(), df_fact['idCountry_mapped'])
-                else:
-                    df_fact['idCountry'] = df_fact['idCountry_mapped']
-
-                # cleanup temp cols
-                df_fact = df_fact.drop(columns=[c for c in ['country_code_norm', 'idCountry_mapped'] if c in df_fact.columns])
-            except Exception:
-                pass
-    except Exception:
-        # non-critical
-        pass
+    if 'cardCode' in df_fact.columns:
+        df_fact = df_fact.drop(columns=['cardCode'])
 
     # ---------------------------
     # Merge con DIM_PRODUCTS
@@ -579,6 +526,9 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
         if 'itemCode' in dim_dfs['product'].columns:
             dim_dfs['product']['itemCode'] = normalize_series(dim_dfs['product']['itemCode'])
     df_fact = df_fact.merge(dim_dfs['product'][['idProduct', 'itemCode']], left_on='ItemCode', right_on='itemCode', how='left')
+
+    if 'itemCode' in df_fact.columns:
+        df_fact = df_fact.drop(columns=['itemCode'])
 
     # ---------------------------
     # Merge opcional: DIM_SALESPERSON
@@ -590,6 +540,9 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
         else:
             df_fact['idSalesperson'] = None
 
+    if 'spCode' in df_fact.columns:
+        df_fact = df_fact.drop(columns=['spCode'])
+
     # ---------------------------
     # Merge opcional: DIM_WAREHOUSE
     # ---------------------------
@@ -600,32 +553,12 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
         else:
             # No warehouse info in source: map to UNK (idWarehouse = 0)
             df_fact['idWarehouse'] = 0
-
-    # ---------------------------
-    # Merge opcional: DIM_COUNTRY (map source Country ISO2 -> idCountry only when missing)
-    # ---------------------------
-    if 'country' in dim_dfs:
-        try:
-            country_df = dim_dfs['country']
-            country_map = country_df[['iso2', 'idCountry']].drop_duplicates(subset=['iso2']).copy()
-            country_map['iso2'] = country_map['iso2'].astype(str).str.strip().str.upper()
-            country_map_dict = dict(zip(country_map['iso2'], country_map['idCountry']))
-
-            if 'Country' in df_fact.columns:
-                df_fact['Country_norm'] = df_fact['Country'].fillna('').astype(str).str.strip().str.upper()
-                if 'idCountry' in df_fact.columns:
-                    missing_mask = df_fact['idCountry'].isna()
-                    df_fact.loc[missing_mask, 'idCountry'] = df_fact.loc[missing_mask, 'Country_norm'].map(country_map_dict)
-                else:
-                    df_fact['idCountry'] = df_fact['Country_norm'].map(country_map_dict)
-                df_fact = df_fact.drop(columns=['Country_norm'])
-            else:
-                if 'idCountry' not in df_fact.columns:
-                    df_fact['idCountry'] = None
-        except Exception:
-            # leave idCountry as-is or None
-            if 'idCountry' not in df_fact.columns:
-                df_fact['idCountry'] = None
+    if 'whsCode' in df_fact.columns:
+        df_fact = df_fact.drop(columns=['whsCode'])
+    if 'idWarehouse' in df_fact.columns:
+        df_fact['idWarehouse'] = pd.to_numeric(df_fact['idWarehouse'], errors='coerce').fillna(0).astype('int64')
+    if 'idWarehouse' in df_fact.columns:
+        df_fact['idWarehouse'] = df_fact['idWarehouse'].fillna(0)
 
     # ---------------------------
     # Merge opcional: DIM_CURRENCY (map DocCur -> idCurrency)
@@ -645,6 +578,12 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
                     df_fact['DocCur_norm'] = df_fact['DocCur_norm'].replace({'COL': 'CRC'})
                 except Exception:
                     pass
+                df_fact['total_usd'] = np.where(
+                    df_fact['DocCur_norm'] == 'USD', df_fact['LineTotal'], df_fact['total_usd']
+                )
+                df_fact['total_crc'] = np.where(
+                    df_fact['DocCur_norm'] == 'CRC', df_fact['LineTotal'], df_fact['total_crc']
+                )
                 df_fact = df_fact.merge(cur_df[['idCurrency', 'code']].drop_duplicates(subset=['code']),
                                         left_on='DocCur_norm', right_on='code', how='left')
                 # if idCurrency not produced, ensure column exists
@@ -661,19 +600,22 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
     # Selección de columnas finales
     # ---------------------------
     fact_columns = [
-        'idDate', 'idCustomer', 'idProduct', 'idSalesperson', 'idWarehouse', 'idCountry', 'idCurrency',
+        'idDate', 'idCustomer', 'idProduct', 'idSalesperson', 'idWarehouse', 'idCurrency',
         'quantity', 'total_usd', 'total_crc', 'source_system', 'source_doc_id'
     ]
 
     # Normalize / map source column names to target fact columns
     df_fact = df_fact.rename(columns={
         'Quantity': 'quantity',
-        'LineTotal': 'total_usd',
         'DocNum': 'source_doc_id'
     })
 
+    if 'LineTotal' in df_fact.columns:
+        df_fact = df_fact.drop(columns=['LineTotal'])
+
+    df_fact['source_system'] = SOURCE_SYSTEM_DB
+
     # Build final selection using available columns, filling missing with NaN
-    available_cols = [c for c in fact_columns if c in df_fact.columns]
     # Ensure all expected fact columns exist in the DataFrame (add NaN where missing)
     for c in fact_columns:
         if c not in df_fact.columns:
@@ -747,7 +689,7 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
     DECIMAL_38_10_MAX = 10**28 - 1
 
     # integer overflow checks
-    int_cols = ['idDate', 'idCustomer', 'idProduct', 'idSalesperson', 'idWarehouse', 'idCountry', 'idCurrency']
+    int_cols = ['idDate', 'idCustomer', 'idProduct', 'idSalesperson', 'idWarehouse', 'idCurrency']
     # Coerce these columns to numeric where possible to avoid NoneType issues with abs()
     for c in int_cols:
         if c in df_fact_final.columns:
@@ -932,8 +874,8 @@ def load_fact_sales(dw_conn, dim_dfs, source_data):
 # 5. FUNCIÓN PRINCIPAL DE EJECUCIÓN (Orquestación)
 # ====================================================================
 
-def run_etl():
-    """Ejecuta el proceso completo de ETL."""
+def run_etl(recreate_schema: bool = False):
+    """Ejecuta el proceso completo de ETL para DB_SALES."""
     
     source_conn = None
     dw_conn = None
@@ -944,8 +886,10 @@ def run_etl():
         dw_conn = connect_to_db(DW_CONN_STR)
         print("Conexiones a DB establecidas.")
         
-        # 2. CREACIÓN DEL ESQUEMA DW
-        create_dw_schema(dw_conn)
+        # 2. CREACIÓN OPCIONAL DEL ESQUEMA DW
+        if recreate_schema:
+            print("Recreando esquema DW...")
+            create_dw_schema(dw_conn)
 
         # 3. Extracción (E)
         source_data = extract_source_data(source_conn)
@@ -962,10 +906,12 @@ def run_etl():
         sqlstate = ex.args[0]
         print(f"\n❌ Error de base de datos: {sqlstate}")
         print(ex)
+        raise
     except Exception as e:
-            print(f"\n❌ Error general en el ETL: {e}")
-            print("📍 Detalle del error:")
-            print(traceback.format_exc())
+        print(f"\n❌ Error general en el ETL: {e}")
+        print("📍 Detalle del error:")
+        print(traceback.format_exc())
+        raise
     finally:
         if source_conn:
             source_conn.close()
@@ -974,4 +920,4 @@ def run_etl():
             print("Conexiones a DB cerradas.")
 
 if __name__ == "__main__":
-    run_etl()
+    run_etl(recreate_schema=True)

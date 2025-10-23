@@ -6,6 +6,20 @@ IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'dw') EXEC('CREATE SCHEMA 
 GO
 
 /* =======================
+   CICLO DE RECREACIÓN
+   ======================= */
+
+IF OBJECT_ID('dw.FACT_SALES','U') IS NOT NULL DROP TABLE dw.FACT_SALES;
+IF OBJECT_ID('dw.DIM_WAREHOUSE','U') IS NOT NULL DROP TABLE dw.DIM_WAREHOUSE;
+IF OBJECT_ID('dw.DIM_SALESPERSON','U') IS NOT NULL DROP TABLE dw.DIM_SALESPERSON;
+IF OBJECT_ID('dw.DIM_PRODUCTS','U') IS NOT NULL DROP TABLE dw.DIM_PRODUCTS;
+IF OBJECT_ID('dw.DIM_CUSTOMERS','U') IS NOT NULL DROP TABLE dw.DIM_CUSTOMERS;
+IF OBJECT_ID('dw.DIM_CURRENCY','U') IS NOT NULL DROP TABLE dw.DIM_CURRENCY;
+IF OBJECT_ID('dw.DIM_COUNTRY','U') IS NOT NULL DROP TABLE dw.DIM_COUNTRY;
+IF OBJECT_ID('dw.DIM_TIME','U') IS NOT NULL DROP TABLE dw.DIM_TIME;
+GO
+
+/* =======================
    DIMENSIONES
    ======================= */
 
@@ -15,16 +29,27 @@ CREATE TABLE dw.DIM_TIME (
   [date]        DATE          NOT NULL,
   [year]        INT           NOT NULL,
   [month]       TINYINT       NOT NULL,
+  [day]         TINYINT       NOT NULL,
+  [quarter]     TINYINT       NOT NULL,
+  month_name    NVARCHAR(15)  NOT NULL,
   tc_usd_crc    DECIMAL(18,6) NULL                       -- desde TIPOS_DE_CAMBIO
 );
 CREATE UNIQUE INDEX UX_DIM_TIME_DATE ON dw.DIM_TIME([date]);
+
+-- Dimensión de países (origen cliente si aplica)
+CREATE TABLE dw.DIM_COUNTRY (
+  idCountry  INT IDENTITY(1,1) PRIMARY KEY,
+  iso2       NCHAR(2)       NOT NULL UNIQUE,
+  [name]     NVARCHAR(100)  NOT NULL
+);
 
 -- Dimensión de clientes
 CREATE TABLE dw.DIM_CUSTOMERS (
   idCustomer  INT IDENTITY(1,1) PRIMARY KEY,
   cardCode    NVARCHAR(50)  NOT NULL UNIQUE,             -- ej: código SAP o 'AGG_JSON'
   [name]      NVARCHAR(200) NOT NULL,
-  zona        NVARCHAR(100) NULL
+  zona        NVARCHAR(100) NULL,
+  idCountry   INT               NULL REFERENCES dw.DIM_COUNTRY(idCountry)
 );
 
 -- Dimensión de productos
@@ -47,13 +72,6 @@ CREATE TABLE dw.DIM_WAREHOUSE (
   idWarehouse  INT IDENTITY(1,1) PRIMARY KEY,
   whsCode      NVARCHAR(50)  NOT NULL UNIQUE,
   [name]       NVARCHAR(200) NOT NULL
-);
-
--- Dimensión de países (origen cliente si aplica)
-CREATE TABLE dw.DIM_COUNTRY (
-  idCountry  INT IDENTITY(1,1) PRIMARY KEY,
-  iso2       NCHAR(2)       NOT NULL UNIQUE,
-  [name]     NVARCHAR(100)  NOT NULL
 );
 
 -- Opcional: dimensión de moneda (por si se quiere consultar por moneda nativa)
@@ -79,7 +97,6 @@ CREATE TABLE dw.FACT_SALES (
   idProduct       INT           NOT NULL REFERENCES dw.DIM_PRODUCTS(idProduct),
   idSalesperson   INT               NULL REFERENCES dw.DIM_SALESPERSON(idSalesperson),
   idWarehouse     INT               NULL REFERENCES dw.DIM_WAREHOUSE(idWarehouse),
-  idCountry       INT               NULL REFERENCES dw.DIM_COUNTRY(idCountry),
   idCurrency      INT               NULL REFERENCES dw.DIM_CURRENCY(idCurrency),
 
   quantity        DECIMAL(21,6) NOT NULL,  -- positiva en facturas, negativa en devoluciones

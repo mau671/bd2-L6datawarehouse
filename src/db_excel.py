@@ -1,14 +1,11 @@
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 import pyodbc
-from datetime import datetime
-from db_config import (  SOURCE_CONN_STR, DW_CONN_STR, connect_to_db )
-from db_create_tables import create_dw_schema
-import warnings
-import traceback
-from decimal import Decimal, InvalidOperation
+from src.db_config import DW_CONN_STR, connect_to_db
 
-def etl_dim_time_from_excel(excel_path, dw_conn, sheet_name='time_data'):
+def etl_dim_time_from_excel(excel_path, dw_conn, sheet_name=None):
     """
     ETL para cargar la dimensión DIM_TIME desde un archivo Excel.
     - Lee un Excel con una columna de fechas.
@@ -23,8 +20,19 @@ def etl_dim_time_from_excel(excel_path, dw_conn, sheet_name='time_data'):
     # 1. EXTRACCIÓN
     # ====================================================
     try:
-        df_time = pd.read_excel(excel_path, sheet_name=sheet_name)
-        print(f"✅ Archivo '{excel_path}' leído correctamente ({len(df_time)} filas).")
+        path = Path(excel_path)
+        if not path.exists():
+            raise FileNotFoundError(f"No se encontró el archivo de tipos de cambio: {path}")
+
+        if path.suffix.lower() == '.csv':
+            df_time = pd.read_csv(path)
+        else:
+            read_kwargs = {}
+            if sheet_name is not None:
+                read_kwargs['sheet_name'] = sheet_name
+            df_time = pd.read_excel(path, **read_kwargs)
+
+        print(f"✅ Archivo '{path}' leído correctamente ({len(df_time)} filas).")
 
         # 🔍 Mostrar columnas detectadas
         print("🔍 Columnas detectadas en el Excel:")
@@ -68,10 +76,15 @@ def etl_dim_time_from_excel(excel_path, dw_conn, sheet_name='time_data'):
     df_time['idDate'] = df_time['date'].dt.strftime('%Y%m%d').astype(int)
     df_time['year'] = df_time['date'].dt.year
     df_time['month'] = df_time['date'].dt.month.astype('int8')
+    df_time['day'] = df_time['date'].dt.day.astype('int8')
+    df_time['quarter'] = df_time['date'].dt.quarter.astype('int8')
+    df_time['month_name'] = df_time['date'].dt.strftime('%B')
 
     # Si no existe tc_usd_crc, agregarla vacía
     if 'tc_usd_crc' not in df_time.columns:
         df_time['tc_usd_crc'] = np.nan
+
+    df_time['tc_usd_crc'] = pd.to_numeric(df_time['tc_usd_crc'], errors='coerce')
 
     # Eliminar duplicados por idDate
     df_time = df_time.drop_duplicates(subset=['idDate'])
@@ -91,25 +104,53 @@ def etl_dim_time_from_excel(excel_path, dw_conn, sheet_name='time_data'):
     # ====================================================
     # 4. CARGA AL DATA WAREHOUSE
     # ====================================================
-    cols = ['idDate', 'date', 'year', 'month', 'tc_usd_crc']
+    cols = ['idDate', 'date', 'year', 'month', 'day', 'quarter', 'month_name', 'tc_usd_crc']
     df_to_load = df_time[cols].copy()
 
     try:
         cursor = dw_conn.cursor()
-        insert_sql = f"""
-            INSERT INTO dw.DIM_TIME (idDate, date, year, month, tc_usd_crc)
-            VALUES (?, ?, ?, ?, ?)
-        """
-        cursor.fast_executemany = True
-        data_to_insert = [tuple(x) for x in df_to_load.to_numpy()]
-        
-        cursor.executemany(insert_sql, data_to_insert)
+        existing_ids_df = pd.read_sql("SELECT idDate FROM dw.DIM_TIME", dw_conn)
+        existing_ids = set(existing_ids_df['idDate'].astype(int).tolist()) if not existing_ids_df.empty else set()
+
+        df_to_insert = df_to_load[~df_to_load['idDate'].isin(existing_ids)].copy()
+        df_to_update = df_to_load[df_to_load['idDate'].isin(existing_ids)].copy()
+
+        inserted = 0
+        updated = 0
+
+        if not df_to_insert.empty:
+            insert_sql = (
+                "INSERT INTO dw.DIM_TIME (idDate, date, year, month, day, quarter, month_name, tc_usd_crc) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            cursor.fast_executemany = True
+            data_to_insert = [tuple(x) for x in df_to_insert.to_numpy()]
+            cursor.executemany(insert_sql, data_to_insert)
+            inserted = len(data_to_insert)
+
+        if not df_to_update.empty:
+            update_sql = (
+                "UPDATE dw.DIM_TIME "
+                "SET date = ?, year = ?, month = ?, day = ?, quarter = ?, month_name = ?, tc_usd_crc = ? "
+                "WHERE idDate = ?"
+            )
+            cursor.fast_executemany = True
+            data_to_update = [
+                (
+                    row['date'], int(row['year']), int(row['month']), int(row['day']),
+                    int(row['quarter']), row['month_name'], row['tc_usd_crc'], int(row['idDate'])
+                )
+                for _, row in df_to_update.iterrows()
+            ]
+            cursor.executemany(update_sql, data_to_update)
+            updated = len(data_to_update)
+
         dw_conn.commit()
 
-        print(f"✅ Carga completada: {len(df_to_load)} registros insertados en dw.DIM_TIME.")
+        print(f"✅ Carga completada: {inserted} registros insertados y {updated} actualizados en dw.DIM_TIME.")
 
     except pyodbc.Error as e:
-        print(f"❌ Error al insertar en DIM_TIME: {e}")
+        print(f"❌ Error al cargar DIM_TIME: {e}")
         dw_conn.rollback()
     except Exception as e:
         print(f"❌ Error inesperado durante la carga: {e}")
@@ -197,7 +238,7 @@ def main():
         print("Conexiones a DB establecidas.")
 
         # 2️⃣ Pedir la ruta al Excel
-        excel_path = "../files/TiposCambio_USD_CRC_2024_2025.xlsx"
+        excel_path = "../data/raw/TiposCambio_USD_CRC_2024_2025.xlsx"
 
         # 3️⃣ Pedir el nombre de la hoja (opcional)
         sheet_name = "Sheet1"
