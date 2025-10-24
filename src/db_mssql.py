@@ -200,6 +200,95 @@ def process_and_load_dim(df_source, source_key, dim_name, dw_conn, dw_table):
     lookup_df = pd.read_sql(f"SELECT {', '.join(select_cols)} FROM dw.{dw_table}", dw_conn)
     return lookup_df
 
+
+def _resolve_credit_base_documents(df_sales, df_credits):
+    """Empareja notas de crédito con sus facturas base cuando RIN1 no expone BaseEntry/BaseLine."""
+
+    if df_credits.empty or df_sales.empty:
+        return df_credits
+
+    work_invoices = df_sales.copy()
+    work_credits = df_credits.copy()
+
+    def _unit_price(df):
+        qty = df['Quantity'].replace(0, np.nan)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return df['LineTotal'] / qty
+
+    work_invoices['UnitPrice'] = _unit_price(work_invoices)
+    work_invoices['remaining_qty'] = work_invoices['Quantity'].fillna(0).astype(float)
+    work_invoices['DocDate'] = pd.to_datetime(work_invoices['DocDate'], errors='coerce')
+
+    work_credits['UnitPrice'] = _unit_price(work_credits).abs()
+    work_credits['DocDate'] = pd.to_datetime(work_credits['DocDate'], errors='coerce')
+    work_credits['BaseDocEntry'] = np.nan
+    work_credits['BaseLine'] = np.nan
+    work_credits['BaseDocNum'] = np.nan
+    work_credits['BaseDocDate'] = pd.NaT
+
+    price_tol = 1e-4
+    qty_tol = 1e-6
+
+    for idx, credit_row in work_credits.iterrows():
+        qty_needed = abs(float(credit_row.get('Quantity', 0) or 0))
+        amt_needed = abs(float(credit_row.get('LineTotal', 0) or 0))
+        if qty_needed <= qty_tol or amt_needed <= price_tol:
+            continue
+
+        candidates = work_invoices[
+            (work_invoices['CardCode'] == credit_row['CardCode'])
+            & (work_invoices['ItemCode'] == credit_row['ItemCode'])
+            & (work_invoices['DocCur'] == credit_row['DocCur'])
+            & (work_invoices['remaining_qty'] > qty_tol)
+        ]
+
+        if pd.notna(credit_row.get('SlpCode')):
+            candidates = candidates[candidates['SlpCode'] == credit_row['SlpCode']]
+
+        unit_price = credit_row.get('UnitPrice')
+        if pd.notna(unit_price):
+            tol = max(price_tol, abs(unit_price) * price_tol)
+            candidates = candidates[
+                candidates['UnitPrice'].notna()
+                & (np.abs(candidates['UnitPrice'] - unit_price) <= tol)
+            ]
+
+        if candidates.empty:
+            continue
+
+        credit_date = credit_row.get('DocDate')
+        if pd.notna(credit_date):
+            prior_matches = candidates[candidates['DocDate'] <= credit_date]
+            if not prior_matches.empty:
+                candidates = prior_matches.sort_values('DocDate', ascending=False)
+            else:
+                candidates = candidates.sort_values('DocDate', ascending=True)
+        else:
+            candidates = candidates.sort_values('DocDate', ascending=True)
+
+        matched_entry = False
+        for cand_idx, cand in candidates.iterrows():
+            available_qty = float(cand['remaining_qty'])
+            if available_qty + qty_tol < qty_needed:
+                continue
+
+            work_credits.at[idx, 'BaseDocEntry'] = cand['DocEntry']
+            work_credits.at[idx, 'BaseLine'] = cand['LineNum']
+            work_credits.at[idx, 'BaseDocNum'] = cand['DocNum']
+            work_credits.at[idx, 'BaseDocDate'] = cand['DocDate']
+            work_invoices.at[cand_idx, 'remaining_qty'] = max(0.0, available_qty - qty_needed)
+            matched_entry = True
+            break
+
+        if not matched_entry:
+            continue
+
+    unmatched = work_credits['BaseDocEntry'].isna().sum()
+    if unmatched:
+        print(f"⚠️ No se pudieron reconciliar {unmatched} líneas de notas de crédito con una factura base; se mantendrán como documentos independientes.")
+
+    return work_credits.drop(columns=['UnitPrice'])
+
 # ====================================================================
 # 2. FUNCIÓN DE EXTRACCIÓN (Extract - E)
 # ====================================================================
@@ -235,34 +324,180 @@ def extract_source_data(conn):
     # B. Consolidación de Hechos
     sales_query = """
     SELECT 
-        T1.DocDate, T1.CardCode, T1.SlpCode, T1.DocNum, 
-        T2.ItemCode, T2.Quantity, T2.LineTotal, T1.DocCur,
+        T1.DocDate,
+        T1.CardCode,
+        T1.SlpCode,
+        T1.DocNum,
+        T1.DocEntry,
+        T2.LineNum,
+        T2.ItemCode,
+        T2.Quantity,
+        T2.LineTotal,
+        T1.DocCur,
+        CAST(NULL AS INT) AS BaseDocEntry,
+        CAST(NULL AS INT) AS BaseLine,
+        CAST(NULL AS INT) AS BaseDocNum,
+        CAST(NULL AS DATE) AS BaseDocDate,
         'INVOICE' AS TransactionType
     FROM OINV T1 
     INNER JOIN INV1 T2 ON T1.DocEntry = T2.DocEntry
     """
     df_sales = pd.read_sql(sales_query, conn)
     
-    credit_query = """
+    credit_query_base = """
     SELECT 
-        T1.DocDate, T1.CardCode, T1.SlpCode, T1.DocNum, 
-        T2.ItemCode, T2.Quantity * -1 AS Quantity, 
-        T2.LineTotal * -1 AS LineTotal, T1.DocCur,
+        T1.DocDate,
+        T1.CardCode,
+        T1.SlpCode,
+        T1.DocNum,
+        T1.DocEntry,
+        T2.LineNum,
+        T2.ItemCode,
+        T2.Quantity * -1 AS Quantity,
+        T2.LineTotal * -1 AS LineTotal,
+        T1.DocCur,
+        T2.BaseEntry AS BaseDocEntry,
+        T2.BaseLine AS BaseLine,
+        T3.DocNum AS BaseDocNum,
+        T3.DocDate AS BaseDocDate,
         'CREDIT_NOTE' AS TransactionType
     FROM ORIN T1 
     INNER JOIN RIN1 T2 ON T1.DocEntry = T2.DocEntry
+    LEFT JOIN OINV T3 ON T3.DocEntry = T2.BaseEntry
     """
-    df_credits = pd.read_sql(credit_query, conn)
+
+    base_refs_available = True
+    try:
+        df_credits = pd.read_sql(credit_query_base, conn)
+    except Exception as credit_err:
+        err_msg = str(credit_err)
+        if "BaseEntry" in err_msg and "BaseLine" in err_msg:
+            base_refs_available = False
+            fallback_query = """
+            SELECT 
+                T1.DocDate,
+                T1.CardCode,
+                T1.SlpCode,
+                T1.DocNum,
+                T1.DocEntry,
+                T2.LineNum,
+                T2.ItemCode,
+                T2.Quantity * -1 AS Quantity,
+                T2.LineTotal * -1 AS LineTotal,
+                T1.DocCur,
+                CAST(NULL AS INT) AS BaseDocEntry,
+                CAST(NULL AS INT) AS BaseLine,
+                CAST(NULL AS INT) AS BaseDocNum,
+                CAST(NULL AS DATE) AS BaseDocDate,
+                'CREDIT_NOTE' AS TransactionType
+            FROM ORIN T1 
+            INNER JOIN RIN1 T2 ON T1.DocEntry = T2.DocEntry
+            """
+            df_credits = pd.read_sql(fallback_query, conn)
+        else:
+            raise
+
+    if not base_refs_available:
+        df_credits = _resolve_credit_base_documents(df_sales, df_credits)
     
     df_fact = pd.concat([df_sales, df_credits], ignore_index=True)
-    
+
     # CORRECCIÓN CRÍTICA: Convertir DocDate a datetime
     try:
         df_fact['DocDate'] = pd.to_datetime(df_fact['DocDate'])
     except Exception as e:
         print(f"❌ Error al convertir la columna 'DocDate' a tipo fecha: {e}")
-        raise 
-        
+        raise
+
+    # Ajustar metadatos para netear notas de crédito con sus facturas base
+    for col in ['DocEntry', 'LineNum', 'BaseDocEntry', 'BaseLine', 'BaseDocNum']:
+        if col in df_fact.columns:
+            df_fact[col] = pd.to_numeric(df_fact[col], errors='coerce')
+
+    if 'BaseDocDate' in df_fact.columns:
+        try:
+            df_fact['BaseDocDate'] = pd.to_datetime(df_fact['BaseDocDate'])
+        except Exception:
+            df_fact['BaseDocDate'] = pd.NaT
+
+    base_mask = df_fact['BaseDocEntry'].notna()
+    if 'BaseDocDate' in df_fact.columns:
+        df_fact.loc[base_mask & df_fact['BaseDocDate'].notna(), 'DocDate'] = df_fact.loc[
+            base_mask & df_fact['BaseDocDate'].notna(), 'BaseDocDate'
+        ]
+
+    valid_base_line = base_mask & df_fact['BaseLine'].notna() & (df_fact['BaseLine'] >= 0)
+    df_fact['resolved_doc_entry'] = df_fact['BaseDocEntry'].where(base_mask, df_fact['DocEntry'])
+    df_fact['resolved_line_num'] = df_fact['LineNum']
+    df_fact.loc[valid_base_line, 'resolved_line_num'] = df_fact.loc[valid_base_line, 'BaseLine']
+    df_fact['resolved_doc_num'] = df_fact['DocNum']
+    df_fact.loc[base_mask & df_fact['BaseDocNum'].notna(), 'resolved_doc_num'] = df_fact.loc[
+        base_mask & df_fact['BaseDocNum'].notna(), 'BaseDocNum'
+    ]
+
+    # Consolidar facturas y notas de crédito para obtener el valor neto por documento / producto
+    try:
+        net_group_keys = ['resolved_doc_entry', 'resolved_line_num', 'ItemCode', 'CardCode', 'SlpCode', 'DocCur']
+        before_rows = len(df_fact)
+
+        groupby_kwargs = {'as_index': False}
+        try:
+            df_fact_grouped = (
+                df_fact
+                .groupby(net_group_keys, dropna=False, **groupby_kwargs)
+                .agg({
+                    'DocDate': 'min',  # conservar la fecha más antigua (típicamente la factura original)
+                    'Quantity': 'sum',
+                    'LineTotal': 'sum',
+                    'resolved_doc_num': 'first'
+                })
+            )
+        except TypeError:
+            # Compatibilidad con versiones de pandas sin parámetro dropna
+            df_fact_grouped = (
+                df_fact
+                .groupby(net_group_keys, **groupby_kwargs)
+                .agg({
+                    'DocDate': 'min',
+                    'Quantity': 'sum',
+                    'LineTotal': 'sum',
+                    'resolved_doc_num': 'first'
+                })
+            )
+
+        df_fact = df_fact_grouped.copy()
+        df_fact.rename(columns={
+            'resolved_doc_entry': 'DocEntry',
+            'resolved_line_num': 'LineNum',
+            'resolved_doc_num': 'DocNum'
+        }, inplace=True)
+        if 'DocNum' in df_fact.columns:
+            df_fact['DocNum'] = pd.to_numeric(df_fact['DocNum'], errors='coerce')
+            try:
+                df_fact['DocNum'] = df_fact['DocNum'].astype('Int64')
+            except Exception:
+                pass
+
+        # Filtrar combinaciones cuyo neto resultó en cero para evitar duplicados innecesarios
+        if not df_fact.empty:
+            qty_is_zero = df_fact['Quantity'].fillna(0).astype(float).abs() < 1e-9
+            amt_is_zero = df_fact['LineTotal'].fillna(0).astype(float).abs() < 1e-6
+            zero_mask = qty_is_zero & amt_is_zero
+            if zero_mask.any():
+                df_fact = df_fact.loc[~zero_mask].copy()
+
+        if VERBOSE:
+            after_rows = len(df_fact)
+            print(f"[AGG] FACT_SALES filas consolidadas de {before_rows} a {after_rows}")
+    except Exception as agg_err:
+        print(f"❌ Error al consolidar facturas/notas de crédito: {agg_err}")
+        raise
+
+    df_fact.drop(columns=[
+        'DocEntry', 'LineNum', 'BaseDocEntry', 'BaseLine', 'BaseDocNum',
+        'BaseDocDate', 'resolved_doc_entry', 'resolved_line_num', 'resolved_doc_num'
+    ], inplace=True, errors='ignore')
+
     source_data['sales_fact'] = df_fact
     
     print("Extracción de Datos Fuente completada.")
