@@ -40,7 +40,12 @@ services:
       - ./../db/init_dw:/scripts
     networks:
       - dw_net
-    entrypoint: ["/bin/bash","-lc","bash /scripts/run-init.sh"]
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - |
+        find /scripts -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
+        bash /scripts/run-init.sh
 
 volumes:
   mssql_dw_data:
