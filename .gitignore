@@ -4,6 +4,7 @@ infra/volumes/*
 
 # Ignore backups and DB dumps
 infra/backups/
+!infra/backups/DB_SALES.bak
 
 # Ignore environment files containing secrets
 .env
