@@ -47,8 +47,6 @@ pip install uv
 ### Preparación del entorno
 
 ```bash
-cp .env.example .env.local
-cp .env.example .env
 uv sync
 ```
 
@@ -63,6 +61,8 @@ Las variables se leen en el siguiente orden: `.env.local`, `.env` y finalmente e
 ```bash
 docker network create dw_net || true
 ```
+
+Agregar archivo DB_SALES.bak en `infra/backups/`.
 
 ### Base de datos fuente (`DB_SALES`)
 
