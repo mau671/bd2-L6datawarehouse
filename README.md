@@ -109,14 +109,19 @@ docker compose --env-file .env.local -f infra/compose/mssql_dw.yaml up --build -
 ```bash
 docker compose --env-file .env.local -f infra/compose/mssql_source.yaml down --volumes --remove-orphans
 docker compose --env-file .env.local -f infra/compose/mssql_dw.yaml down --volumes --remove-orphans
+
 docker volume rm mssql_source_data || true
 docker volume rm mssql_dw_data || true
+
 chmod +x infra/db/init_source/run-init.sh
 chmod +x infra/db/init_dw/run-init.sh
+
 docker compose --env-file .env.local -f infra/compose/mssql_source.yaml up -d mssql_source
 docker compose --env-file .env.local -f infra/compose/mssql_dw.yaml up -d mssql_dw
+
 docker logs -f mssql_source
 docker logs -f mssql_dw
+
 docker compose --env-file .env.local -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
 docker compose --env-file .env.local -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
 ```
