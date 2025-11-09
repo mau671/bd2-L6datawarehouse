@@ -65,7 +65,7 @@ Los scripts automatizan la gestión de ambas bases de datos (Source y Data Wareh
 #### Linux/macOS
 
 ```bash
-# Levantar ambas bases de datos
+# Levantar ambas bases de datos (solo contenedores de motor)
 ./scripts/dev_up.sh
 
 # Detener ambas bases de datos
@@ -81,7 +81,7 @@ Los scripts automatizan la gestión de ambas bases de datos (Source y Data Wareh
 #### Windows (PowerShell)
 
 ```powershell
-# Levantar ambas bases de datos
+# Levantar ambas bases de datos (solo contenedores de motor)
 .\scripts\dev_up.ps1
 
 # Detener ambas bases de datos
