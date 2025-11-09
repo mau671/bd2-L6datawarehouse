@@ -85,10 +85,10 @@ Uso:
   .\scripts\dev_up.ps1 [comando]
 
 Comandos:
-  Up         Levantar las bases de datos (default)
-  Down       Detener y remover contenedores
+    Up         Levantar las bases de datos (solo motores)
+    Down       Detener contenedores y eliminar volúmenes/huérfanos
     Init       Ejecutar contenedores de inicialización (scripts)
-  Help       Mostrar esta ayuda
+    Help       Mostrar esta ayuda
 
 Ejemplos:
   .\scripts\dev_up.ps1              # Levantar todas las BD
@@ -106,6 +106,27 @@ Archivos de configuración requeridos:
     - infra\compose\mssql_dw.yaml
 "@
         Write-Host $helpText
+}
+
+function Stop-Services {
+    Write-Log "Deteniendo bases de datos y eliminando volúmenes..." -Type Info
+    Push-Location $ComposeDir
+    try {
+        if ($EnvFileToUse) {
+            Write-Log "Usando archivo de entorno: $EnvFileToUse" -Type Info
+            Write-Log "Deteniendo MSSQL Data Warehouse..." -Type Info
+            docker compose --env-file "$EnvFileToUse" -f mssql_dw.yaml down --volumes --remove-orphans
+            Write-Log "Deteniendo MSSQL Source..." -Type Info
+            docker compose --env-file "$EnvFileToUse" -f mssql_source.yaml down --volumes --remove-orphans
+        } else {
+            Write-Log "Deteniendo MSSQL Data Warehouse..." -Type Info
+            docker compose -f mssql_dw.yaml down --volumes --remove-orphans
+            Write-Log "Deteniendo MSSQL Source..." -Type Info
+            docker compose -f mssql_source.yaml down --volumes --remove-orphans
+        }
+        Write-Log "Servicios detenidos y volúmenes eliminados" -Type Success
+    }
+    finally { Pop-Location }
 }
 
 function Test-Dependencies {
@@ -153,35 +174,27 @@ function Ensure-Network {
 
 function Start-Services {
     Write-Log "Levantando bases de datos (solo motores)..." -Type Info
-    
     Ensure-Network
-    
     Push-Location $ComposeDir
-    
     try {
         if ($EnvFileToUse) {
             Write-Log "Usando archivo de entorno: $EnvFileToUse" -Type Info
             Write-Log "Levantando MSSQL Source (motor)..." -Type Info
             docker compose --env-file "$EnvFileToUse" -f mssql_source.yaml up -d mssql_source
-            
             Write-Log "Levantando MSSQL Data Warehouse (motor)..." -Type Info
             docker compose --env-file "$EnvFileToUse" -f mssql_dw.yaml up -d mssql_dw
         } else {
             Write-Log "No se encontró .env.local ni .env, usando variables de entorno del sistema" -Type Warning
             Write-Log "Levantando MSSQL Source (motor)..." -Type Info
             docker compose -f mssql_source.yaml up -d mssql_source
-            
             Write-Log "Levantando MSSQL Data Warehouse (motor)..." -Type Info
             docker compose -f mssql_dw.yaml up -d mssql_dw
         }
-        
         Write-Log "Motores levantados correctamente" -Type Success
         Write-Log "MSSQL Source: localhost:14331" -Type Info
         Write-Log "MSSQL Data Warehouse: localhost:14332" -Type Info
     }
-    finally {
-        Pop-Location
-    }
+    finally { Pop-Location }
 }
 
 function Initialize-Services {
