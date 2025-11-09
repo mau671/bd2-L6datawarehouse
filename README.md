@@ -52,11 +52,51 @@ uv sync
 
 Las variables se leen en el siguiente orden: `.env.local`, `.env` y finalmente el entorno del sistema.
 
+**Nota importante**: Crear un archivo `.env.local` basado en `.env.example` con las credenciales y configuración de tu entorno local.
+
 ---
 
 ## Infraestructura local
 
-### Crear red Docker
+### Método recomendado: Usar scripts automáticos
+
+Los scripts automatizan la gestión de ambas bases de datos (Source y Data Warehouse) y se encargan de crear la red Docker necesaria.
+
+#### Linux/macOS
+
+```bash
+# Levantar ambas bases de datos
+./scripts/dev_up.sh
+
+# Detener ambas bases de datos
+./scripts/dev_up.sh down
+
+# Inicializar/ejecutar semillas en ambas bases (sin borrar contenedores)
+./scripts/dev_up.sh init
+
+# Ver ayuda
+./scripts/dev_up.sh --help
+```
+
+#### Windows (PowerShell)
+
+```powershell
+# Levantar ambas bases de datos
+.\scripts\dev_up.ps1
+
+# Detener ambas bases de datos
+.\scripts\dev_up.ps1 Down
+
+# Inicializar/ejecutar semillas en ambas bases (sin borrar contenedores)
+.\scripts\dev_up.ps1 Init
+
+# Ver ayuda
+.\scripts\dev_up.ps1 Help
+```
+
+### Método manual: Comandos Docker Compose
+
+#### Crear red Docker
 
 ```bash
 docker network create dw_net || true
@@ -64,7 +104,7 @@ docker network create dw_net || true
 
 Agregar archivo DB_SALES.bak en `infra/backups/`.
 
-### Base de datos fuente (`DB_SALES`)
+#### Base de datos fuente (`DB_SALES`)
 
 ```bash
 docker compose --env-file .env.local -f infra/compose/mssql_source.yaml up -d mssql_source
@@ -72,7 +112,7 @@ docker logs -f mssql_source
 docker compose --env-file .env.local -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
 ```
 
-#### Notas (`DB_SALES`)
+**Notas (`DB_SALES`)**
 
 - Linux/macOS: comprobar permisos de ejecución (`chmod +x infra/db/init_source/run-init.sh`) y de lectura para `infra/backups/DB_SALES.bak` si se usa el backup (`chmod a+r infra/backups/DB_SALES.bak`).
 - Windows (PowerShell):
@@ -84,7 +124,7 @@ docker compose --env-file .env.local -f infra/compose/mssql_source.yaml up --bui
   docker compose --env-file .env.local -f infra/compose/mssql_source.yaml up --build --force-recreate init_source
   ```
 
-### Data Warehouse (`DW_SALES`)
+#### Data Warehouse (`DW_SALES`)
 
 ```bash
 docker compose --env-file .env.local -f infra/compose/mssql_dw.yaml up -d mssql_dw
@@ -92,7 +132,7 @@ docker logs -f mssql_dw
 docker compose --env-file .env.local -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
 ```
 
-#### Notas (`DW_SALES`)
+**Notas (`DW_SALES`)**
 
 - Linux/macOS: `chmod +x infra/db/init_dw/run-init.sh`.
 - Windows (PowerShell):
@@ -104,7 +144,7 @@ docker compose --env-file .env.local -f infra/compose/mssql_dw.yaml up --build -
   docker compose --env-file .env.local -f infra/compose/mssql_dw.yaml up --build --force-recreate init_dw
   ```
 
-### Reinicializar desde cero
+#### Reinicializar desde cero
 
 ```bash
 docker compose --env-file .env.local -f infra/compose/mssql_source.yaml down --volumes --remove-orphans
@@ -128,7 +168,7 @@ docker compose --env-file .env.local -f infra/compose/mssql_dw.yaml up --build -
 
 Cuando las rutas o nombres de servicios cambien, ajustar los comandos. En algunos entornos Linux puede requerirse `sudo` delante de `docker`.
 
-### Conexión manual
+#### Conexión manual
 
 ```bash
 sqlcmd -S localhost,14331 -U sa -P "PassSuperSegura!"
